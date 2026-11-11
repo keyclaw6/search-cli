@@ -11,28 +11,8 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub keys: ApiKeys,
     pub settings: Settings,
-    /// metasearch.sh account, populated by `search login`. Independent of the
-    /// per-provider keys above: either, both, or neither may be set.
-    #[serde(default)]
-    pub metasearch: Metasearch,
-}
-
-/// Field names deliberately avoid underscores — figment splits `SEARCH_*` env
-/// vars on `_`, so `token` maps cleanly from `SEARCH_METASEARCH_TOKEN` while
-/// an `api_key` field would not.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Metasearch {
-    /// `ms_live_…` API key issued by `search login`.
-    #[serde(default)]
-    pub token: String,
-    /// Account email, cached purely so `search config show` can display it.
-    #[serde(default)]
-    pub email: String,
-    /// Override the API host (self-host or local dev). Empty = metasearch.sh.
-    #[serde(default)]
-    pub url: String,
-    // `max_providers` (0.10 to 0.12.0) is read and ignored: since 0.12.1
-    // metasearch.sh picks the engines of a hosted search itself.
+    // A section this build does not know (an older version's account
+    // section among them) is read and ignored, so an old file still loads.
 }
 
 /// An integer, or a string holding one: versions before 0.10 could save
@@ -184,7 +164,6 @@ impl Default for AppConfig {
             settings: Settings {
                 count: default_count(),
             },
-            metasearch: Metasearch::default(),
         }
     }
 }
@@ -231,11 +210,13 @@ fn tighten_config_permissions() {
 }
 
 /// Valid provider key names for `config set keys.<name>`: every provider
-/// that takes a key, from the provider specs.
+/// whose key the config file holds. The social platforms read theirs from
+/// `SCRAPECREATORS_API_KEY` only, so `keys.tiktok` is refused rather than
+/// written and ignored.
 pub fn provider_keys() -> Vec<&'static str> {
     crate::providers::all()
         .iter()
-        .filter(|s| !s.env_keys.is_empty())
+        .filter(|s| !s.env_keys.is_empty() && ApiKeys::default().get(s.name).is_some())
         .map(|s| s.name)
         .collect()
 }
@@ -264,9 +245,6 @@ fn mask_keys(keys: &[String]) -> String {
 
 /// Valid setting names for `config set settings.<name>`.
 pub const SETTING_KEYS: &[&str] = &["count"];
-
-/// Valid field names for `config set metasearch.<name>`.
-pub const METASEARCH_KEYS: &[&str] = &["token", "email", "url"];
 
 pub fn mask_key(key: &str) -> String {
     // Char-based: byte-slicing (`&key[..2]`) panics on multi-byte UTF-8 and
@@ -334,41 +312,6 @@ pub fn config_show(config: &AppConfig) {
     } else {
         println!("  count    = {}", config.settings.count);
     }
-
-    println!();
-    let token = crate::auth::resolve_token(config);
-    let host = crate::auth::resolve_base_url(config);
-    if c {
-        println!("  {}", "[metasearch]".bold());
-        if token.is_empty() {
-            println!(
-                "    {:<10} {}",
-                "account".white(),
-                "not logged in — run `search login`".dimmed()
-            );
-        } else {
-            let who = if config.metasearch.email.is_empty() {
-                "logged in".to_string()
-            } else {
-                config.metasearch.email.clone()
-            };
-            println!("    {:<10} {}", "account".white(), who.green());
-            println!("    {:<10} {}", "token".white(), mask_key(&token).green());
-        }
-        println!("    {:<10} {}", "host".white(), host.dimmed());
-    } else {
-        println!("[metasearch]");
-        println!(
-            "  account  = {}",
-            if token.is_empty() {
-                "(not logged in)"
-            } else {
-                config.metasearch.email.as_str()
-            }
-        );
-        println!("  token    = {}", mask_key(&token));
-        println!("  host     = {host}");
-    }
     println!();
 }
 
@@ -402,18 +345,9 @@ pub fn config_set(key: &str, value: &str) -> Result<(), crate::errors::SearchErr
                     key_value(value)
                 }
                 "settings" => parse_setting(name, value)?,
-                "metasearch" => {
-                    if !METASEARCH_KEYS.contains(name) {
-                        return Err(SearchError::Config(format!(
-                            "Unknown field 'metasearch.{name}'. Valid: {}",
-                            METASEARCH_KEYS.join(", ")
-                        )));
-                    }
-                    toml::Value::String(value.to_string())
-                }
                 other => {
                     return Err(SearchError::Config(format!(
-                        "Unknown section '{other}'. Use 'keys.<provider>', 'settings.<name>', or 'metasearch.<name>'."
+                        "Unknown section '{other}'. Use 'keys.<provider>' or 'settings.<name>'."
                     )));
                 }
             };
@@ -453,35 +387,6 @@ fn key_value(value: &str) -> toml::Value {
     } else {
         toml::Value::String(keys.into_iter().next().unwrap_or_default())
     }
-}
-
-/// Remove a dotted key (e.g. `metasearch.token`) from the config file.
-/// Absent keys are not an error — `search logout` must be idempotent.
-pub fn config_unset(key: &str) -> Result<(), SearchError> {
-    let path = config_path();
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut doc: toml::Table = std::fs::read_to_string(&path)?
-        .parse()
-        .map_err(|e: toml::de::Error| SearchError::Config(e.to_string()))?;
-
-    let parts: Vec<&str> = key.split('.').collect();
-    let [section, name] = parts.as_slice() else {
-        return Err(SearchError::Config(format!(
-            "Invalid key '{key}'. Use a dotted form like 'metasearch.token'."
-        )));
-    };
-    match doc.get_mut(*section) {
-        Some(toml::Value::Table(t)) => {
-            if t.remove(*name).is_none() {
-                return Ok(());
-            }
-        }
-        _ => return Ok(()),
-    }
-
-    write_config_atomic(&path, &doc)
 }
 
 /// Atomic replace (temp + rename) so concurrent writes can't interleave a torn
@@ -686,11 +591,11 @@ mod tests {
                 super::AppConfig::default(),
             ))
             .merge(figment::providers::Toml::string(
-                "[settings]\ntimeout = \"30\"\ncount = \"7\"\n[metasearch]\nmax_providers = \"4\"\n",
+                "[settings]\ntimeout = \"30\"\ncount = \"7\"\n[account]\ntoken = \"t\"\nmax_providers = \"4\"\n",
             ))
             .extract()
             .unwrap();
         assert_eq!(cfg.settings.count, 7);
-        // The retired metasearch.max_providers still loads.
+        // A section this build does not know still loads, ignored.
     }
 }

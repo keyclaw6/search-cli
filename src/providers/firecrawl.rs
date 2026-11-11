@@ -43,7 +43,7 @@ impl Firecrawl {
 /// Firecrawl bills one credit per page and one per PDF page; this caps a
 /// PDF at 20 credits.
 const PDF_MAX_PAGES: u32 = 20;
-/// One Firecrawl credit at the rate-card price (PLAN.md §5), in micro-USD.
+/// One Firecrawl credit at its list price, in micro-USD.
 const MICROS_PER_CREDIT: u64 = 5_000;
 
 #[derive(Deserialize)]

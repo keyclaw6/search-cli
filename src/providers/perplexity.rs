@@ -73,7 +73,7 @@ fn body(call: &Call<'_>) -> Value {
         b["search_domain_filter"] = json!(deny);
     }
     // News has no vertical here: without -f it means the last week, as on
-    // linkup and the hosted API.
+    // linkup.
     let recency = opts
         .freshness
         .as_deref()

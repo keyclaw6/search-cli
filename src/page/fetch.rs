@@ -23,7 +23,7 @@ const UA: &str = concat!(
     " (+https://github.com/paperfoot/search-cli)"
 );
 
-/// Body cap, the same as the hosted service: a page bigger than this is not
+/// Body cap: a page bigger than this is not
 /// an article, and the cap keeps a binary URL from filling memory.
 pub const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 

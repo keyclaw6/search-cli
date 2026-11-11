@@ -15,8 +15,7 @@
 //!
 //! - **Global search fallback:** when the live route refuses a search that
 //!   names no subreddit, the social platforms' upstream (ScrapeCreators'
-//!   Reddit search) answers it: directly with `SCRAPECREATORS_API_KEY`, else
-//!   through metasearch.sh when logged in and the server offers it.
+//!   Reddit search) answers it, with `SCRAPECREATORS_API_KEY`.
 //!
 //! `SEARCH_REDDIT_ROUTE=archive` skips the live route; `live` skips the
 //! archive.
@@ -983,8 +982,7 @@ impl Reddit {
 }
 
 impl Reddit {
-    /// The global search fallback: direct with the platforms' key, else
-    /// hosted when metasearch.sh offers Reddit.
+    /// The global search fallback, with the platforms' key.
     async fn global_search(&self, call: &Call<'_>) -> Result<Output, String> {
         use super::social_api as api;
         // The platforms' keys, fallbacks included: a key refused or out of
@@ -1028,44 +1026,7 @@ impl Reddit {
                 }
             }
         }
-        let client = crate::hosted::MetasearchClient::new(&self.ctx)
-            .ok()
-            .flatten()
-            .ok_or("global search needs `search login`")?;
-        let offered = client
-            .manifest()
-            .await
-            .is_some_and(|m| m.offer("reddit", Mode::Community).is_some());
-        if !offered {
-            return Err("global search is not offered by metasearch.sh yet".into());
-        }
-        let idempotency = uuid::Uuid::new_v4().to_string();
-        let body = crate::hosted::search_body(
-            Mode::Community,
-            call.query,
-            call.count,
-            &super::NO_FILTERS,
-            &crate::hosted::BodyOpts {
-                providers: Some(&["reddit"]),
-                allowed: &[],
-                rerank: None,
-                fresh: false,
-            },
-        );
-        let (mut out, _) = client
-            .search("reddit", &body, &idempotency, call.timeout)
-            .await
-            .map_err(|e| format!("global search through metasearch.sh: {e}"))?;
-        for r in &mut out.results {
-            if let Some(obj) = r
-                .extra
-                .get_or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-            {
-                obj.insert("route".into(), "hosted".into());
-            }
-        }
-        Ok(out)
+        Err(format!("global search needs {}", api::ENV_KEYS[0]))
     }
 }
 

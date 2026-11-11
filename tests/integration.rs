@@ -234,7 +234,7 @@ fn test_config_show() {
         .assert()
         .success()
         .stdout(predicate::str::contains("count"))
-        .stdout(predicate::str::contains("metasearch"));
+        .stdout(predicate::str::contains("key_counts"));
 }
 
 /// The JSON-mode stream contract: one JSON document on stdout even on error,
@@ -792,4 +792,79 @@ fn usage_shows_out_of_credit_keys_and_cache_clear_keys_forgets_them() {
     let json: serde_json::Value = serde_json::from_slice(&usage().stdout).unwrap();
     assert!(json["out_of_credit_keys"].as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Serve one HTML article on 127.0.0.1 for `requests` connections.
+fn serve_article(requests: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let para =
+        "Rank fusion merges the result lists of several search engines into one list. ".repeat(12);
+    let body = format!(
+        "<!doctype html><html><head><title>Rank fusion</title></head><body><article><h1>Rank fusion</h1><p>{para}</p><p>{para}</p><p>{para}</p></article></body></html>"
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(requests) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body.as_bytes());
+        }
+    });
+    format!("http://{addr}/article")
+}
+
+/// A successful search through the binary, offline: piped JSON is one
+/// compact line, and --pretty indents it.
+#[test]
+fn piped_json_is_one_compact_line_and_pretty_indents_it() {
+    let url = serve_article(4);
+    let args = [
+        "search",
+        "-q",
+        &url,
+        "-m",
+        "extract",
+        "-p",
+        "direct",
+        "--allow-private",
+        "--no-cache",
+    ];
+    let out = offline_cmd("compact").args(args).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.trim_end().lines().count(), 1, "{text}");
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["status"], "success", "{text}");
+    assert_eq!(json["metadata"]["transport"]["direct"], "local", "{text}");
+    let out = offline_cmd("compact")
+        .args(args)
+        .arg("--pretty")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.lines().count() > 5, "{text}");
+    serde_json::from_str::<serde_json::Value>(&text).unwrap();
+}
+
+/// An older version's account commands are refused (exit 3), never
+/// searched as a query and billed.
+#[test]
+fn retired_account_commands_are_refused_not_searched() {
+    for args in [
+        &["login"][..],
+        &["whoami"],
+        &["logout", "--revoke"],
+        &["update"],
+    ] {
+        let out = offline_cmd("retired").args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("invalid_input"), "{args:?}: {stdout}");
+    }
 }

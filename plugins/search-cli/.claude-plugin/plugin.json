@@ -2,7 +2,7 @@
   "name": "search-cli",
   "displayName": "search CLI",
   "version": "0.12.1",
-  "description": "Teaches Claude to use the search CLI: auto or explicit modes over eleven search engines, TikTok, Instagram, YouTube, X, Reddit and Hacker News, page extraction with video transcripts, cost in every result. Needs the search binary (brew install paperfoot/tap/search-cli).",
+  "description": "Teaches Claude to use the search CLI: auto or explicit modes over eleven search engines, TikTok, Instagram, YouTube, X, Reddit and Hacker News, page extraction with video transcripts, cost in every result. Needs the search binary (cargo install --locked --git https://github.com/keyclaw6/search-cli --branch ryote).",
   "author": {
     "name": "Paperfoot AI",
     "url": "https://paperfoot.si"
@@ -18,8 +18,5 @@
     "cli"
   ],
   "documentationUrl": "https://github.com/paperfoot/search-cli#readme",
-  "supportUrl": "https://metasearch.sh/contact",
-  "privacyPolicyUrl": "https://metasearch.sh/privacy",
-  "termsOfServiceUrl": "https://metasearch.sh/terms",
   "icon": "./icon.png"
 }

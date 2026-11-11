@@ -191,7 +191,7 @@ impl SearchError {
                 provider
             )),
             Self::NoProviders(mode) => Some(format!(
-                "No provider can serve mode '{mode}'. Run `search login` to use any engine on your metasearch.sh balance, or add a key (search config check)"
+                "No provider can serve mode '{mode}'. Add a key for one of its engines (search config check)"
             )),
             Self::InvalidInput { .. } => Some("Check arguments with: search --help".to_string()),
             Self::AllProvidersFailed { failed, .. } => Some(suggestion_for_failures(failed)),
@@ -329,8 +329,8 @@ pub fn category_for_status(status: u16) -> FailureCategory {
     }
 }
 
-/// Secret values known to this process (provider keys, the metasearch.sh
-/// token), registered once at startup so an upstream that echoes a key back
+/// Secret values known to this process (every provider key, fallbacks
+/// included), registered once at startup so an upstream that echoes a key back
 /// in any shape is still scrubbed.
 static KNOWN_SECRETS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
@@ -342,12 +342,12 @@ pub fn register_secrets(values: impl IntoIterator<Item = String>) {
 /// Prefixes of credential formats the CLI handles; a word that starts with
 /// one is a key whatever the surrounding text says.
 const KEY_PREFIXES: &[&str] = &[
-    "ms_live_", "ms_test_", "sk-", "tvly-", "xai-", "fc-", "pplx-", "jina_", "lsv2_", "BSA",
+    "sk-", "tvly-", "xai-", "fc-", "pplx-", "jina_", "lsv2_", "BSA",
 ];
 
 /// Scrub credential values from user-visible strings: the one redaction every
-/// error string goes through (envelopes, tracing warnings, doctor, usage,
-/// hosted). Covers `api_key=`-style query and body parameters, `Bearer`
+/// error string goes through (envelopes, tracing warnings, doctor, usage).
+/// Covers `api_key=`-style query and body parameters, `Bearer`
 /// tokens, words in a known key format, and every key registered at startup.
 pub fn redact_secrets(s: &str) -> String {
     let mut out = redact_markers(s);
@@ -463,11 +463,11 @@ mod tests {
         );
         assert_eq!(redact_secrets("no secrets here"), "no secrets here");
         assert_eq!(
-            redact_secrets("Authorization: Bearer ms_live_abcdef123456 sent"),
+            redact_secrets("Authorization: Bearer sk-abcdef123456 sent"),
             "Authorization: Bearer REDACTED sent"
         );
         assert_eq!(
-            redact_secrets("key ms_live_0123456789abcdef was revoked"),
+            redact_secrets("key sk-ant-0123456789abcdef was revoked"),
             "key REDACTED was revoked"
         );
         assert_eq!(

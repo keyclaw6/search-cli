@@ -8,10 +8,6 @@ ignore = [
     # indicatif -> number_prefix: unmaintained formatting helper, no upgrade
     # published; cosmetic dependency (spinner), not on any network path.
     "RUSTSEC-2025-0119",
-    # quick-xml 0.38 inside self_update: only its S3 backend parses XML, and
-    # `search update` uses the GitHub backend. Drop once self_update moves.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
 
 [licenses]

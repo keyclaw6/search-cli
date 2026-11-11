@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "paperfoot",
-  "description": "Web search for AI agents: the search CLI skill and the metasearch.sh MCP server.",
+  "description": "Web search for AI agents: the search CLI skill.",
   "owner": {
     "name": "Paperfoot AI",
     "url": "https://paperfoot.si"
@@ -9,14 +9,8 @@
   "plugins": [
     {
       "name": "search-cli",
-      "description": "Teaches Claude to use the search CLI: auto or explicit modes over eleven search engines, TikTok, Instagram, YouTube, X, Reddit and Hacker News, page extraction with video transcripts, cost in every result. Needs the search binary (brew install paperfoot/tap/search-cli).",
+      "description": "Teaches Claude to use the search CLI: auto or explicit modes over eleven search engines, TikTok, Instagram, YouTube, X, Reddit and Hacker News, page extraction with video transcripts, cost in every result. Needs the search binary (cargo install --locked --git https://github.com/keyclaw6/search-cli --branch ryote).",
       "source": "./plugins/search-cli",
-      "category": "productivity"
-    },
-    {
-      "name": "metasearch",
-      "description": "The metasearch.sh MCP server: search the web, news, papers, people, places, patents and X posts, and read any page, with a skill for when to search and which mode to ask for. Sign in to metasearch.sh on first use; searches are charged to the organisation you choose.",
-      "source": "./plugins/metasearch",
       "category": "productivity"
     }
   ]

@@ -1,7 +1,6 @@
 //! The one provider list in the crate. Every adapter file defines `pub static SPEC: ProviderSpec` and implements
-//! `Adapter`; routing, agent-info, config, doctor, usage, stats and hosted transport all read these records.
-//! A provider is called per (provider, mode), exactly like the hosted API, so a hosted call is the same call
-//! sent to metasearch.sh instead of the upstream.
+//! `Adapter`; routing, agent-info, config, doctor, usage and stats all read these records.
+//! A provider is called per (provider, mode).
 
 use crate::errors::SearchError;
 use crate::types::{Answer, FailureCategory, Mode, SearchOpts, SearchResult, Transport};
@@ -18,7 +17,7 @@ pub struct FilterSupport {
 }
 
 /// Upstream list price estimate in micro-USD: agent-info, stats, and `metadata.cost` for own-key calls
-/// when the upstream reports no cost of its own. Numbers match the server's rate card (PLAN.md §5).
+/// when the upstream reports no cost of its own.
 #[derive(Debug, Clone, Copy)]
 pub struct Price {
     pub per_call: u32,
@@ -61,7 +60,7 @@ pub struct Call<'a> {
     pub opts: &'a SearchOpts,
     pub timeout: Duration,
     /// The key this call sends: one of [`Adapter::keys`], chosen by the
-    /// engine; empty for keyless and hosted calls.
+    /// engine; empty for keyless calls.
     pub key: &'a str,
 }
 
@@ -79,7 +78,7 @@ pub trait Adapter: Send + Sync {
     /// Own key present (env > SEARCH_KEYS_* > file), or keyless.
     fn is_configured(&self) -> bool;
     /// The own keys, in the order the engine tries them (see
-    /// [`super::keys_for`]); empty for keyless and hosted adapters.
+    /// [`super::keys_for`]); empty for keyless adapters.
     fn keys(&self) -> Vec<String> {
         Vec::new()
     }
@@ -103,7 +102,7 @@ pub trait Adapter: Send + Sync {
         self.spec().price.estimate(0)
     }
     /// How this adapter reaches its upstream: own key (direct), keyless on
-    /// this machine (local); the hosted adapter overrides it.
+    /// this machine (local).
     fn transport(&self) -> Transport {
         if self.spec().env_keys.is_empty() {
             Transport::Local
@@ -112,15 +111,9 @@ pub trait Adapter: Send + Sync {
         }
     }
     /// Which of the caller's filters this adapter actually sends for `opts`;
-    /// the engine warns about every requested filter left out. Direct calls
-    /// follow the spec; the hosted adapter follows metasearch.sh's manifest.
+    /// the engine warns about every requested filter left out.
     fn applied_filters(&self, _opts: &SearchOpts) -> FilterSupport {
         self.spec().filters
-    }
-    /// The hosted twin of a provider you hold no key for; the engine folds
-    /// these into one metasearch.sh call per search.
-    fn as_hosted(&self) -> Option<&crate::hosted::HostedAdapter> {
-        None
     }
     fn name(&self) -> &'static str {
         self.spec().name

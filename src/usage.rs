@@ -25,7 +25,7 @@ pub struct ProviderUsage {
     /// it has more than one: each key is its own account and balance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<usize>,
-    /// direct | local | hosted | none: how a search would reach it.
+    /// direct | local | none: how a search would reach it.
     pub transport: String,
     /// Provider-reported usage figures, normalized where possible. Keys vary
     /// by provider (each bills differently); `credits_remaining` is populated
@@ -65,42 +65,6 @@ fn unsupported(name: &str, configured: bool, transport: &str) -> ProviderUsage {
         data: None,
         error: None,
     }
-}
-
-/// The metasearch.sh account as a usage row: the balance hosted calls draw on.
-async fn metasearch_usage(ctx: &AppContext) -> Option<ProviderUsage> {
-    let row = |data: Option<serde_json::Value>, error: Option<String>| ProviderUsage {
-        provider: "metasearch".to_string(),
-        supported: true,
-        configured: true,
-        key: None,
-        transport: "hosted".to_string(),
-        data,
-        error,
-    };
-    let client = match crate::hosted::MetasearchClient::new(ctx) {
-        Ok(Some(c)) => c,
-        Ok(None) => return None,
-        Err(e) => {
-            return Some(row(
-                None,
-                Some(crate::errors::redact_secrets(&e.to_string())),
-            ))
-        }
-    };
-    Some(match client.me().await {
-        Ok(me) => row(
-            Some(serde_json::json!({
-                "credits_remaining": me.balance_usd,
-                "unit": "USD",
-                "email": me.email,
-                "daily_cap_usd": me.key.daily_cap_usd,
-                "spent_today_usd": me.key.spent_today_usd,
-            })),
-            None,
-        ),
-        Err(e) => row(None, Some(crate::errors::redact_secrets(&e.to_string()))),
-    })
 }
 
 async fn get_json(
@@ -300,16 +264,12 @@ pub async fn collect(ctx: Arc<AppContext>) -> Vec<ProviderUsage> {
     let all = providers::build_providers(&ctx);
     let mut out = Vec::new();
     let mut set: JoinSet<ProviderUsage> = JoinSet::new();
-    let account = metasearch_usage(&ctx).await;
-    let hosted_ok = account.as_ref().is_some_and(|a| a.error.is_none());
 
     for p in &all {
         let name = p.name();
         let configured = p.is_configured();
         let transport = if configured {
             p.transport().as_str()
-        } else if hosted_ok && !p.spec().env_keys.is_empty() {
-            "hosted"
         } else {
             "none"
         };
@@ -363,7 +323,6 @@ pub async fn collect(ctx: Arc<AppContext>) -> Vec<ProviderUsage> {
         }
     }
     out.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.key.cmp(&b.key)));
-    out.extend(account);
 
     // Snapshot balances so `search stats` can report measured burn over time.
     let snapshot: serde_json::Map<String, serde_json::Value> = out
