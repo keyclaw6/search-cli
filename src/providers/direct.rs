@@ -1,4 +1,4 @@
-//! `direct`: rung 0 of the extract chain (PLAN.md D11). One honest GET that
+//! `direct`: rung 0 of the extract chain. One honest GET that
 //! asks for markdown first, follows redirects with the SSRF guard on every
 //! hop, and returns the page as markdown when it is real content. Free and
 //! keyless; works on every platform.

@@ -30,7 +30,7 @@ pub static SPEC: ProviderSpec = ProviderSpec {
 };
 
 /// Reader (extract) estimate when Jina reports no token count: 250 µ$,
-/// the server's quote (metasearch `providers/jina.ts`). Reader has no
+/// the published quote. Reader has no
 /// 10k-token minimum, so it costs less than a search (`SPEC.price`).
 const READER: Price = Price {
     per_call: 250,

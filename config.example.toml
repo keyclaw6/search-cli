@@ -8,6 +8,8 @@
 #   1. <PROVIDER>_API_KEY      e.g. BRAVE_API_KEY, SERPER_API_KEY
 #   2. SEARCH_KEYS_<PROVIDER>  e.g. SEARCH_KEYS_BRAVE, SEARCH_KEYS_SERPER
 #   3. this file
+# The social platforms read SCRAPECREATORS_API_KEY (and _2, _3, ...) from the
+# environment only.
 #
 # Set keys without leaving them in shell history:
 #   echo "$KEY" | search config set keys.brave -
@@ -34,12 +36,3 @@ browserless = ""
 
 [settings]
 count = 10            # results per search when -c is not given
-
-[metasearch]
-# Written by `search login`; METASEARCH_TOKEN or SEARCH_METASEARCH_TOKEN override it.
-token = ""
-# Another host for login and hosted calls (default https://metasearch.sh).
-# METASEARCH_URL overrides it; any other host needs METASEARCH_ALLOW_INSECURE_HOST=1.
-# url = ""
-# metasearch.sh picks the engines of a hosted search itself (one call per
-# search); name engines with -p to choose them.

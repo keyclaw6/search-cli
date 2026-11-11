@@ -208,9 +208,8 @@ pub struct ResponseMetadata {
     /// `timeout` entry in `provider_failures`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers_timed_out: Vec<String>,
-    /// How each queried provider was reached: "direct" (own key), "local"
-    /// (keyless, runs on this machine) or "hosted" (through metasearch.sh,
-    /// charged to the account balance).
+    /// How each queried provider was reached: "direct" (own key) or "local"
+    /// (keyless, runs on this machine).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub transport: std::collections::BTreeMap<String, String>,
     /// What this search cost upstream, per provider.
@@ -236,8 +235,8 @@ pub struct ResponseMetadata {
     /// Per-provider failure detail (category, HTTP status, reason, retryable).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_failures: Vec<ProviderFailure>,
-    /// Automatic decisions: the mode `auto` resolved to, and whether results
-    /// were reranked. Absent when nothing was decided for the caller.
+    /// Automatic decisions: the mode `auto` resolved to. Absent when nothing
+    /// was decided for the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
     /// Plain one-line notes for the caller (not problems; see `warnings`).
@@ -245,62 +244,23 @@ pub struct ResponseMetadata {
     pub notes: Vec<String>,
 }
 
-/// What the CLI and metasearch.sh decided on the caller's behalf (ROUTING.md).
+/// What the CLI decided on the caller's behalf.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Routing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto: Option<AutoDecision>,
-    /// True when the relevance rerank reordered the results (each then has
-    /// `extra.relevance`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reranked: Option<bool>,
-    /// metasearch.sh answered from its result cache: no engine was asked,
-    /// and the charge is the stored call's (unlike `metadata.cached`, a free
-    /// replay from this machine's cache).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached: Option<bool>,
-    /// When metasearch.sh fetched the cached answer (RFC 3339).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_age_secs: Option<u64>,
-    /// Engines metasearch.sh asked first whose list it set aside for a
-    /// better engine's: never charged (0 in `cost.by_provider`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub escalated: Vec<String>,
 }
 
-/// How `auto` resolved. `source`: "rule" (a decisive pattern), "model"
-/// (metasearch.sh's routing model), "heuristic" (a local signal pattern)
-/// or "fallback" (nothing matched, or a `-p` that cannot serve auto's pick:
-/// general). No model id is carried: the server no longer sends one, and an
-/// older server's is ignored.
+/// How `auto` resolved. `source`: "rule" (a decisive pattern), "heuristic"
+/// (a signal pattern) or "fallback" (nothing matched, or a `-p` that cannot
+/// serve auto's pick: general).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoDecision {
     pub mode: String,
-    #[serde(deserialize_with = "de_source")]
     pub source: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probabilities: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters_applied: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latency_ms: Option<u64>,
-}
-
-/// The sources an envelope may show. Anything else (an older server named
-/// its routing model, and envelopes cached by 0.10.0 repeat it) reads as
-/// "model", the only source that comes from the server's model.
-const SOURCES: [&str; 4] = ["rule", "model", "heuristic", "fallback"];
-
-fn de_source<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    let s = String::deserialize(d)?;
-    Ok(if SOURCES.contains(&s.as_str()) {
-        s
-    } else {
-        "model".to_string()
-    })
 }
 
 /// Cost of one search in micro-USD (1 USD = 1,000,000).
@@ -308,8 +268,7 @@ fn de_source<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error>
 pub struct CostSummary {
     pub micros: u64,
     pub usd: f64,
-    /// "estimate" (list price, or the upstream's own figure, for calls made
-    /// with your keys), "charged" (billed by metasearch.sh), or "mixed".
+    /// "estimate": the list price, or the upstream's own figure.
     pub basis: String,
     pub by_provider: std::collections::BTreeMap<String, u64>,
 }
@@ -333,8 +292,6 @@ pub enum Transport {
     Direct,
     /// Keyless, runs on this machine.
     Local,
-    /// Through metasearch.sh, charged to your balance.
-    Hosted,
 }
 
 impl Transport {
@@ -342,7 +299,6 @@ impl Transport {
         match self {
             Self::Direct => "direct",
             Self::Local => "local",
-            Self::Hosted => "hosted",
         }
     }
 }
@@ -412,27 +368,17 @@ mod tests {
         assert_eq!(j, "\"billing_quota\"");
     }
 
+    /// A cached envelope from an older version (a routing model's fields)
+    /// still loads; the fields this build does not set are dropped.
     #[test]
-    fn an_unknown_routing_source_reads_as_model_and_no_model_id_is_kept() {
+    fn an_older_auto_decision_still_loads() {
         let d: AutoDecision = serde_json::from_value(serde_json::json!({
-            "mode": "general", "source": "vendor-x", "reason": "r",
-            "model": "vendor-x-1.13.0", "latency_ms": 300
+            "mode": "general", "source": "model", "reason": "r",
+            "model": "vendor-x-1.13.0", "latency_ms": 300, "probabilities": {}
         }))
         .unwrap();
-        assert_eq!(d.source, "model");
-        assert_eq!(d.latency_ms, Some(300));
+        assert_eq!(d.mode, "general");
         let out = serde_json::to_string(&d).unwrap();
-        assert!(!out.contains("vendor"), "{out}");
-    }
-
-    #[test]
-    fn known_sources_pass_through() {
-        for source in super::SOURCES {
-            let d: AutoDecision = serde_json::from_value(
-                serde_json::json!({ "mode": "news", "source": source, "reason": "r" }),
-            )
-            .unwrap();
-            assert_eq!(d.source, source);
-        }
+        assert!(!out.contains("vendor") && !out.contains("latency"), "{out}");
     }
 }

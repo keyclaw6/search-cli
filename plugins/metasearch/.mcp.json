@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "metasearch": {
-      "type": "http",
-      "url": "https://metasearch.sh/mcp"
-    }
-  }
-}

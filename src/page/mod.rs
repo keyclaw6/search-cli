@@ -12,7 +12,6 @@
 //!   the conversion, then the verdict on the markdown (a page of navigation
 //!   and footer passes the first and extracts to nothing).
 //!
-//! The verdict rules mirror the hosted service's `page.ts` (PLAN.md §3.8).
 
 mod fetch;
 mod markdown;
@@ -79,8 +78,7 @@ pub struct Extracted {
 /// The page as markdown, or the verdict that rejects it. Judges the raw
 /// body first (status, binary, challenge, JS shell), converts it (markdown
 /// passes through; HTML goes through [`to_markdown`]; other text is kept),
-/// then judges the markdown as the server's `resultVerdict` does, so "thin"
-/// means thin after extraction (PLAN.md §3.8). Synchronous CPU work: run it
+/// then judges the markdown, so "thin" means thin after extraction. Synchronous CPU work: run it
 /// like [`to_markdown`].
 pub fn extract(page: &Page) -> Result<Extracted, Verdict> {
     match page.verdict() {

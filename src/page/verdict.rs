@@ -1,10 +1,8 @@
-//! Is a response content, or junk? A port of the hosted service's
-//! `page.ts` (PLAN.md §3.8), rule for rule, so a page rejected by one is
-//! rejected by both and junk is never billed as success. Both repos test
-//! against the same vectors (`fixtures/verdict-vectors.json`).
+//! Is a response content, or junk? So junk is never billed as success;
+//! tested against `fixtures/verdict-vectors.json`.
 //!
-//! One addition the server does not have yet: a non-2xx status without a
-//! challenge body is [`Verdict::HttpError`], never content.
+//! A non-2xx status without a challenge body is [`Verdict::HttpError`],
+//! never content.
 
 use super::mime_essence;
 use reqwest::header::HeaderMap;
@@ -30,8 +28,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// The rejection code shared with the server (`page.ts` `Rejection`),
-    /// `ok` for content. `http_error` is the CLI's addition.
+    /// The rejection code, `ok` for content.
     pub fn code(&self) -> &'static str {
         match self {
             Verdict::Ok => "ok",
@@ -135,7 +132,7 @@ pub fn verdict(
     Verdict::Ok
 }
 
-/// The server's `TEXTUAL` regex, `^(text/(markdown|x-markdown|html|plain|xml)
+/// The `TEXTUAL` pattern, `^(text/(markdown|x-markdown|html|plain|xml)
 /// |application/(json|xml|xhtml+xml|[\w.+-]+\+(json|xml)))\b`: a prefix
 /// followed by a word boundary, not a whole-string match.
 fn is_textual(media: &str) -> bool {
@@ -623,8 +620,7 @@ mod tests {
                 price: Some("USD 0.01".into())
             }
         );
-        // Without a price a 402 is an error page like any other (as on the
-        // server, which does not treat it as a paywall either).
+        // Without a price a 402 is an error page like any other.
         assert_eq!(verdict("", None, 402, None), Verdict::HttpError(402));
     }
 
@@ -720,9 +716,9 @@ mod tests {
         }
     }
 
-    /// The vectors shared with the server's `page.ts`: same input, same code.
+    /// The verdict vectors: each input gives its expected code.
     #[test]
-    fn shared_vectors_match_the_server() {
+    fn verdict_vectors_give_their_codes() {
         let raw = include_str!("fixtures/verdict-vectors.json");
         let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/page/fixtures");

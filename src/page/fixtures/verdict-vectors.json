@@ -1,5 +1,5 @@
 {
- "_about": "Page verdict vectors shared by search-cli (src/page/verdict.rs) and metasearch.sh (src/lib/engine/page.ts). Keep the two copies identical. body_file is relative to this file. expect is page.ts's Rejection code, or ok.",
+ "_about": "Page verdict vectors for src/page/verdict.rs. body_file is relative to this file. expect is the rejection code, or ok.",
  "vectors": [
   {
    "name": "an article is ok",

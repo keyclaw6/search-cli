@@ -60,9 +60,7 @@ pub struct ModeSpec {
     pub providers: &'static [&'static str],
     pub description: &'static str,
     pub when_to_use: &'static str,
-    /// Whole-run budget: the server's deadline plus 5 s, so a hosted call is
-    /// never abandoned while the server still works on it (PLAN.md §3.5).
-    /// Calls already sent are never cancelled before it.
+    /// Whole-run budget. Calls already sent are never cancelled before it.
     pub deadline: Duration,
     /// Fused modes only: once this long has passed and one provider has
     /// answered with something, stop waiting for the rest (they are
@@ -303,7 +301,7 @@ pub fn providers_for(mode: Mode, query: &str) -> Vec<&'static str> {
 
 /// How many providers a mode may run for this input without `-p`: social
 /// with no platform cue runs the rule pick's count (at most two paid
-/// calls), as metasearch.sh does.
+/// calls).
 pub fn fan_out_cap(mode: Mode, query: &str) -> Option<usize> {
     (mode == Mode::Social && crate::router::social_pins(query).is_empty())
         .then(|| crate::router::pick_social_platforms(query).len())

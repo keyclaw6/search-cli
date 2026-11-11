@@ -74,7 +74,7 @@ pub const COMMUNITY_SOURCES: &[&str] = &["reddit", "hackernews"];
 
 /// The social platforms (`social` mode, beside X): TikTok, Instagram,
 /// YouTube, Facebook and Threads. Counted apart from the search engines;
-/// they run through metasearch.sh.
+/// they share one ScrapeCreators key (`SCRAPECREATORS_API_KEY`).
 pub const SOCIAL_PLATFORMS: &[&str] = social_api::PLATFORMS;
 
 pub fn all() -> &'static [&'static ProviderSpec] {
@@ -326,7 +326,7 @@ pub static NO_FILTERS: crate::types::SearchOpts = crate::types::SearchOpts {
 
 /// Append `site:` / `-site:` operators for providers without native domain filters.
 /// Google-style engines AND bare `site:` terms, so include domains are joined
-/// with `OR` (as the server's `withSiteOperators` does); excludes stay `-site:`.
+/// with `OR`; excludes stay `-site:`.
 pub fn augment_query(query: &str, opts: &crate::types::SearchOpts) -> String {
     let mut q = String::with_capacity(
         query.len() + 16 * (opts.include_domains.len() + opts.exclude_domains.len()),
@@ -438,7 +438,6 @@ mod tests {
             ".claude-plugin/marketplace.json",
             "plugins/search-cli/.claude-plugin/plugin.json",
             "plugins/search-cli/skills/search/SKILL.md",
-            "plugins/metasearch/.claude-plugin/plugin.json",
         ];
         let digits = SEARCH_ENGINES.to_string();
         let mut seen = 0;

@@ -4,13 +4,10 @@
 //! says a key exists; doctor says it works. Each check is one billed
 //! (minimal) request per key, so a spent fallback key shows; scrape-only
 //! providers are probed against example.com.
-//! Providers you have no key for are labelled with their transport (hosted
-//! when logged in) but not probed: a hosted probe would be charged. The
-//! `metasearch` row checks the account itself (`GET /api/v1/me`, free).
+//! Providers you have no key for are listed but not probed.
 
 use crate::context::AppContext;
 use crate::errors::redact_secrets;
-use crate::hosted::MetasearchClient;
 use crate::providers::{self, Call};
 use crate::types::{Mode, SearchOpts};
 use serde::Serialize;
@@ -39,11 +36,8 @@ pub struct Check {
     /// it has more than one: each key is probed, so a spent one shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<usize>,
-    /// direct | local | hosted | none: how a search would reach it.
+    /// direct | local | none: how a search would reach it.
     pub transport: String,
-    /// Account balance (the `metasearch` row only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub balance_usd: Option<f64>,
 }
 
 /// The cheapest mode that exercises the provider: general search where it
@@ -56,55 +50,14 @@ fn probe_mode(modes: &[Mode]) -> Mode {
     }
 }
 
-/// The account row: is the stored token valid, and what is the balance.
-async fn metasearch_check(ctx: &AppContext) -> Option<Check> {
-    let row =
-        |ok: bool, error: Option<String>, latency: Option<u128>, balance: Option<f64>| Check {
-            provider: "metasearch".to_string(),
-            configured: true,
-            ok,
-            latency_ms: latency,
-            results: None,
-            category: (!ok).then(|| "auth".to_string()),
-            error,
-            key: None,
-            transport: "hosted".to_string(),
-            balance_usd: balance,
-        };
-    let client = match MetasearchClient::new(ctx) {
-        Ok(Some(c)) => c,
-        Ok(None) => return None,
-        Err(e) => return Some(row(false, Some(redact_secrets(&e.to_string())), None, None)),
-    };
-    let start = Instant::now();
-    Some(match client.me().await {
-        Ok(me) => row(
-            true,
-            None,
-            Some(start.elapsed().as_millis()),
-            Some(me.balance_usd),
-        ),
-        Err(e) => row(
-            false,
-            Some(truncate(&redact_secrets(&e.to_string()), 160)),
-            Some(start.elapsed().as_millis()),
-            None,
-        ),
-    })
-}
-
 pub async fn run(ctx: Arc<AppContext>) -> Vec<Check> {
     let mut set: JoinSet<Check> = JoinSet::new();
     let mut out = Vec::new();
-    let account = metasearch_check(&ctx).await;
-    let hosted_ok = account.as_ref().is_some_and(|c| c.ok);
 
     for provider in providers::build_providers(&ctx) {
         let name = provider.name();
         if !provider.is_configured() {
-            // Not probed: without a key it runs hosted (when logged in) or
-            // not at all.
-            let hosted = hosted_ok && !provider.spec().env_keys.is_empty();
+            // Not probed: without a key it does not run.
             out.push(Check {
                 provider: name.to_string(),
                 configured: false,
@@ -114,8 +67,7 @@ pub async fn run(ctx: Arc<AppContext>) -> Vec<Check> {
                 error: None,
                 category: None,
                 key: None,
-                transport: if hosted { "hosted" } else { "none" }.to_string(),
-                balance_usd: None,
+                transport: "none".to_string(),
             });
             continue;
         }
@@ -145,7 +97,6 @@ pub async fn run(ctx: Arc<AppContext>) -> Vec<Check> {
         }
     }
     out.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.key.cmp(&b.key)));
-    out.extend(account);
     out
 }
 
@@ -187,7 +138,6 @@ async fn probe(
             category,
             key: slot,
             transport: transport.as_str().to_string(),
-            balance_usd: None,
         };
     match outcome {
         Ok(Ok(output)) => row(true, Some(output.results.len()), None, None),
@@ -226,17 +176,7 @@ pub fn render_human(checks: &[Check]) {
             Some(k) => format!("{} key {k}", c.provider),
             None => c.provider.clone(),
         };
-        if c.provider == "metasearch" && c.ok {
-            println!(
-                "  {:<12} {} {:>5}ms  balance ${:.2}",
-                c.provider.bold(),
-                "ok".green(),
-                c.latency_ms.unwrap_or(0),
-                c.balance_usd.unwrap_or(0.0)
-            );
-        } else if !c.configured && c.transport == "hosted" {
-            println!("  {:<12} {}", c.provider, "hosted (metasearch.sh)".dimmed());
-        } else if !c.configured {
+        if !c.configured {
             println!("  {:<12} {}", c.provider, "not configured".dimmed());
         } else if c.ok {
             println!(

@@ -1,13 +1,12 @@
-//! `auto` mode: the deterministic rules of ROUTING.md, as a pure function.
+//! `auto` mode: deterministic rules, as a pure function.
 //!
-//! Rules 1-5 and 11 are decisive (the first match decides, the routing
-//! model is skipped); rule 11, a community cue (Reddit, Hacker News, "what
-//! do people say about"), is checked right after rule 2. Rules 6-10 are signals: when not logged in the first one in table
-//! order decides; logged in, metasearch.sh's routing model decides. Auto never picks `deep`, and
-//! picks `social` only on an explicit platform cue: X/Twitter, TikTok,
-//! Instagram, YouTube, Threads or a Facebook page. The cue also pins the
-//! social call to the platforms it names ([`social_pins`]). The server runs the same
-//! patterns; the table tests below mirror its vectors.
+//! Rules 1-5 and 11 are decisive (the first match decides); rule 11, a
+//! community cue (Reddit, Hacker News, "what do people say about"), is
+//! checked right after rule 2. Rules 6-10 are signals: the first one in
+//! table order decides. Auto never picks `deep`, and picks `social` only on
+//! an explicit platform cue: X/Twitter, TikTok, Instagram, YouTube, Threads
+//! or a Facebook page. The cue also pins the social call to the platforms it
+//! names ([`social_pins`]). The table tests below hold the vectors.
 
 use crate::types::{AutoDecision, Mode};
 
@@ -24,10 +23,10 @@ pub struct Hit {
     pub label: Option<String>,
 }
 
-/// An explicit `-p` is obeyed exactly (ROUTING.md principle 1), so auto
+/// An explicit `-p` is obeyed exactly, so auto
 /// never resolves to a mode the pinned providers cannot serve: when one of
 /// them cannot serve `mode` and all of them serve general, general it is,
-/// reported as a fallback (the server does the same). `None` keeps `mode`.
+/// reported as a fallback. `None` keeps `mode`.
 pub fn fit_pinned(mode: Mode, pinned: &[String]) -> Option<AutoDecision> {
     let specs: Vec<_> = pinned
         .iter()
@@ -59,9 +58,7 @@ pub fn fit_pinned(mode: Mode, pinned: &[String]) -> Option<AutoDecision> {
             "{} cannot serve {mode}, so {to} was used.",
             cannot.join(", ")
         ),
-        probabilities: None,
         filters_applied: None,
-        latency_ms: None,
     })
 }
 
@@ -173,7 +170,7 @@ const SIGNALS: &[(u8, Mode, &[&str])] = &[
     ),
 ];
 
-/// Rules 6-10 that fire, in table order (names go to the routing model as hints).
+/// Rules 6-10 that fire, in table order.
 pub fn signals(query: &str) -> Vec<Hit> {
     let lower = query.trim().to_lowercase();
     SIGNALS
@@ -184,20 +181,20 @@ pub fn signals(query: &str) -> Vec<Hit> {
         .collect()
 }
 
-/// Modes where a freshness word becomes a filter (ROUTING.md, amended 2 Nov):
+/// Modes where a freshness word becomes a filter (amended 2 Nov):
 /// only those whose point is recency. In general or academic, "today",
 /// "latest" and "breaking" are usually names or versions.
 pub fn freshness_applies(mode: Mode) -> bool {
     matches!(mode, Mode::News | Mode::Social)
 }
 
-/// The freshness auto applies for `mode` (server `freshnessFor`): the
+/// The freshness auto applies for `mode`: the
 /// explicit word's value in news or social, else none.
 pub fn freshness_for(query: &str, mode: Mode) -> Option<(&'static str, String)> {
     freshness_applies(mode).then(|| freshness(query)).flatten()
 }
 
-/// Freshness from explicit words only (ROUTING.md), as (value, word).
+/// Freshness from explicit words only, as (value, word).
 pub fn freshness(query: &str) -> Option<(&'static str, String)> {
     let lower = query.to_lowercase();
     const WORDS: &[(&str, &[&str])] = &[
@@ -211,7 +208,7 @@ pub fn freshness(query: &str) -> Option<(&'static str, String)> {
         .find_map(|(value, words)| first_phrase(&lower, words).map(|w| (*value, w)))
 }
 
-/// The decision without the routing model: decisive rules, then the first signal, then general.
+/// The decision: decisive rules, then the first signal, then general.
 pub fn resolve_local(query: &str) -> (AutoDecision, Option<String>) {
     if let Some(h) = decisive(query) {
         return (decision_for(&h, "rule"), h.query);
@@ -224,9 +221,7 @@ pub fn resolve_local(query: &str) -> (AutoDecision, Option<String>) {
             mode: Mode::General.to_string(),
             source: "fallback".to_string(),
             reason: "No routing rule matched; used general.".to_string(),
-            probabilities: None,
             filters_applied: None,
-            latency_ms: None,
         },
         None,
     )
@@ -248,14 +243,12 @@ pub fn decision_for(h: &Hit, source: &str) -> AutoDecision {
         mode: h.mode.to_string(),
         source: source.to_string(),
         reason: format!("{why} (rule {}); used {}.", h.rule, h.mode),
-        probabilities: None,
         filters_applied: None,
-        latency_ms: None,
     }
 }
 
-/// Modes `auto` may hand to the engine; anything else from the server
-/// (deep, an unknown name) falls back to general.
+/// Modes `auto` may hand to the engine; anything else (deep, an unknown
+/// name) falls back to general.
 pub fn auto_mode(name: &str) -> Option<Mode> {
     use clap::ValueEnum;
     let m = Mode::from_str(name, true).ok()?;
@@ -321,8 +314,7 @@ fn is_absolute_url(q: &str) -> bool {
 }
 
 /// At-words that are code, not X handles: decorators, annotations, CSS
-/// at-rules, doc tags, chat mentions and bare npm scopes. Copied from the
-/// server's `CODE_AT_WORDS` (metasearch `src/lib/engine/judge.ts`); a wrong
+/// at-rules, doc tags, chat mentions and bare npm scopes. A wrong
 /// social route costs about 45x a general search and returns posts, not docs.
 const CODE_AT_WORDS: &[&str] = &[
     // Python, Java, Kotlin, Swift, TypeScript decorators and annotations
@@ -477,8 +469,7 @@ const CODE_AT_WORDS: &[&str] = &[
     "swc",
 ];
 
-/// Rule 2, as amended in ROUTING.md (source of truth: the server's
-/// `socialCue()`): (a) `tweet(s)`/`twitter`, except as a web-dev word;
+/// Rule 2, as amended: (a) `tweet(s)`/`twitter`, except as a web-dev word;
 /// (b) `on X`, case-sensitive, never before `axis`; (c) `x.com/`; (d) a lone
 /// `@handle` that is not a code at-word. Returns the cue for the reason.
 fn x_cue(q: &str) -> Option<String> {
@@ -753,10 +744,7 @@ pub fn social_pins(query: &str) -> Vec<&'static str> {
 }
 
 /// The platforms a social search with no platform cue asks, at most two
-/// paid calls: X plus the one most likely to hold the answer. The same
-/// rules, in the same order, as metasearch.sh's rule-based pick
-/// (`pickSocialPlatforms`), so both sides choose alike; logged in, the
-/// server refines this with its own model.
+/// paid calls: X plus the one most likely to hold the answer.
 pub fn pick_social_platforms(query: &str) -> Vec<&'static str> {
     const REAL_TIME: &[&str] = &[
         "breaking",
@@ -1049,7 +1037,7 @@ fn patent_word(lower: &str) -> Option<String> {
         .map(|w| w.to_string())
 }
 
-/// Rule 4's numbers, case-sensitive like the server's `PATENT_NUMBER`:
+/// Rule 4's numbers, case-sensitive:
 /// `\b(?:US|EP)\s?\d{7,8}(?:\s?[AB]\d)?\b|\bWO\s?\d{4}\/?\d{6}\b`. A phone
 /// number after "call us" or a long order number is not a patent.
 fn patent_number(q: &str) -> Option<String> {
@@ -1190,11 +1178,9 @@ mod tests {
         assert!(fit_pinned(Mode::General, &p(&["exa"])).is_none());
     }
 
-    /// The server's rule 4 and 5 vectors (metasearch `judge.test.ts`, "rules
-    /// 4 and 5: patents and images fire on their patterns and stay quiet on
-    /// traps"), amended 2 Nov 2026: system images and look-alike numbers are
-    /// not decisive. The extra cases were checked against the server's
-    /// regexes in node.
+    /// Rules 4 and 5 fire on their patterns and stay quiet on traps,
+    /// amended 2 Nov 2026: system images and look-alike numbers are not
+    /// decisive.
     #[test]
     fn rules_4_and_5_fire_on_their_patterns_and_stay_quiet_on_traps() {
         let rule = |q: &str| decisive(q).map(|h| h.mode.to_string());
@@ -1237,7 +1223,7 @@ mod tests {
         }
     }
 
-    /// Mirrors the server's vectors: (query, mode, source) without the routing model.
+    /// The rule vectors: (query, mode, source).
     #[test]
     fn rule_table() {
         let cases: &[(&str, &str, &str)] = &[
@@ -1447,7 +1433,7 @@ mod tests {
         assert!(fit_pinned(Mode::General, &p(&["reddit", "serper"])).is_none());
     }
 
-    /// The server's judge.test.ts vectors for amended rule 2: developer
+    /// The vectors for amended rule 2: developer
     /// at-words, npm scopes, plot axes and Twitter as a web-dev word are not
     /// social (a wrong social route costs about 45x a general search).
     #[test]
@@ -1498,9 +1484,9 @@ mod tests {
         assert_eq!(local("SITES LIKE https://example.com").0, "similar");
     }
 
-    /// The server's judge.test.ts freshness vectors, through the local rules.
+    /// The freshness vectors, through the rules.
     #[test]
-    fn freshness_vectors_match_the_server() {
+    fn freshness_vectors() {
         let f = |q: &str| {
             let (d, _) = resolve_local(q);
             freshness_for(q, auto_mode(&d.mode).unwrap()).map(|f| f.0)
@@ -1568,9 +1554,9 @@ mod tests {
         assert_eq!(d.reason, "Matched 'near me' (rule 6); used places.");
     }
 
-    /// The same pick, rule for rule, as metasearch.sh's pickSocialPlatforms.
+    /// The social pick, rule for rule.
     #[test]
-    fn social_pick_matches_the_server_rules() {
+    fn social_pick_follows_the_rules() {
         assert_eq!(pick_social_platforms("earthquake right now"), ["xai"]);
         assert_eq!(pick_social_platforms("viral dance"), ["xai", "tiktok"]);
         assert_eq!(

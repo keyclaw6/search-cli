@@ -16,9 +16,8 @@ use clap::{Parser, Subcommand};
         say about\" searches community, and\n\
         so on; the decision is reported in metadata.routing.auto. An\n\
         explicit -m or -p is always obeyed. Auto never picks deep.\n\
-        Engines without your own key run through metasearch.sh after\n\
-        `search login`, charged to your balance; each result's cost is in\n\
-        metadata.cost. Run `search agent-info` for the machine-readable map.\n\
+        Every engine runs on your own key; each result's estimated cost is\n\
+        in metadata.cost. Run `search agent-info` for the machine-readable map.\n\
         Prints tables on a terminal and one compact JSON line when piped\n\
         (--pretty indents it). NO_COLOR turns colour off.\n\n\
         PROVIDERS:\n  \
@@ -39,11 +38,11 @@ use clap::{Parser, Subcommand};
           xai        Real-time X/Twitter search (Grok agentic)\n  \
           reddit     Reddit posts and whole threads (no key; paced ~10/min)\n  \
           hackernews Hacker News stories, comments, threads (no key)\n  \
-          tiktok     TikTok videos: search, transcript, comments (search login)\n  \
-          instagram  Instagram reels and posts (search login)\n  \
-          youtube    YouTube videos and shorts, transcripts (search login)\n  \
-          facebook   Facebook pages and posts (search login)\n  \
-          threads    Threads posts and replies (search login)\n\n\
+          tiktok     TikTok videos: search, transcript, comments (ScrapeCreators key)\n  \
+          instagram  Instagram reels and posts (ScrapeCreators key)\n  \
+          youtube    YouTube videos and shorts, transcripts (ScrapeCreators key)\n  \
+          facebook   Facebook pages and posts (ScrapeCreators key)\n  \
+          threads    Threads posts and replies (ScrapeCreators key)\n\n\
         EXAMPLES:\n  \
           search \"rust error handling\"                    # auto mode\n  \
           search search -q \"CRISPR\" -m academic           # academic papers\n  \
@@ -123,18 +122,13 @@ pub enum Commands {
         action: ConfigAction,
     },
 
-    /// Sign in to metasearch.sh and store an API key for this machine
-    Login(LoginArgs),
-
-    /// Remove the stored metasearch.sh credentials from this machine
-    Logout {
-        /// Also revoke the key server-side so it stops working everywhere
-        #[arg(long)]
-        revoke: bool,
+    /// Names an older version had for its account commands: refused here
+    /// (exit 3) rather than searched as a query.
+    #[command(hide = true, name = "login", aliases = ["logout", "whoami"])]
+    Retired {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _rest: Vec<String>,
     },
-
-    /// Show which metasearch.sh account this machine is signed in to
-    Whoami,
 
     /// Show machine-readable capabilities (for agents)
     AgentInfo,
@@ -152,7 +146,9 @@ pub enum Commands {
         action: SkillAction,
     },
 
-    /// Check for updates or self-update
+    /// Not in this build: it is reinstalled from source, never replaced
+    /// by an upstream release
+    #[command(hide = true)]
     Update {
         /// Only check, don't install
         #[arg(long)]
@@ -174,17 +170,6 @@ pub enum Commands {
         #[command(subcommand)]
         action: CacheAction,
     },
-}
-
-#[derive(Parser)]
-pub struct LoginArgs {
-    /// Print the URL instead of launching a browser (headless boxes, SSH)
-    #[arg(long)]
-    pub no_browser: bool,
-
-    /// API host to sign in to (default: https://metasearch.sh)
-    #[arg(long)]
-    pub url: Option<String>,
 }
 
 #[derive(Parser)]
@@ -229,9 +214,8 @@ pub struct SearchArgs {
     #[arg(short, long, default_value = "auto", value_parser = parse_mode_arg)]
     pub mode: ModeArg,
 
-    /// Keep the fused order: skip the relevance rerank that runs for
-    /// logged-in users in general, news, academic, scholar, people and deep
-    #[arg(long)]
+    /// Accepted and ignored, so older scripts keep working.
+    #[arg(long, hide = true)]
     pub no_rerank: bool,
 
     /// Number of results to return
@@ -254,8 +238,7 @@ pub struct SearchArgs {
     #[arg(short, long)]
     pub freshness: Option<String>,
 
-    /// Fresh results: skip the local 5-minute query cache and, logged in,
-    /// metasearch.sh's result cache (sends fresh: true)
+    /// Fresh results: skip the local 5-minute query cache
     #[arg(long)]
     pub no_cache: bool,
 
@@ -316,7 +299,7 @@ pub enum ConfigAction {
     Show,
     /// Set a configuration value (e.g. keys.brave YOUR_KEY)
     Set {
-        /// Config key (e.g. keys.brave, settings.count, metasearch.url)
+        /// Config key (e.g. keys.brave, settings.count)
         key: String,
         /// Value to set. Pass "-" to read it from stdin, keeping secrets out
         /// of shell history and process listings. For keys.<provider>,
