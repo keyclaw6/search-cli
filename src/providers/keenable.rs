@@ -52,10 +52,6 @@ impl Keenable {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         Self { ctx }
     }
-
-    fn api_key(&self) -> String {
-        super::key_for(&self.ctx.config, &SPEC)
-    }
 }
 
 fn body(call: &Call<'_>) -> Value {
@@ -131,8 +127,12 @@ impl Adapter for Keenable {
         &SPEC
     }
 
+    fn keys(&self) -> Vec<String> {
+        super::keys_for(&self.ctx.config, &SPEC)
+    }
+
     fn is_configured(&self) -> bool {
-        !self.api_key().is_empty()
+        !self.keys().is_empty()
     }
 
     fn sent_cost(&self, _mode: Mode) -> u64 {
@@ -147,11 +147,11 @@ impl Adapter for Keenable {
         }
         let body = body(call);
         let client = &self.ctx.client;
-        let api_key = self.api_key();
+        let api_key = call.key;
         let resp = super::send(self, call.timeout, || {
             client
                 .post(ENDPOINT)
-                .header("X-API-Key", api_key.as_str())
+                .header("X-API-Key", api_key)
                 .json(&body)
         })
         .await?;
@@ -172,6 +172,7 @@ mod tests {
             count,
             opts,
             timeout: Duration::from_secs(5),
+            key: "",
         }
     }
 
