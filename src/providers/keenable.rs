@@ -52,10 +52,6 @@ impl Keenable {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         Self { ctx }
     }
-
-    fn api_key(&self) -> String {
-        super::key_for(&self.ctx.config, &SPEC)
-    }
 }
 
 fn body(call: &Call<'_>) -> Value {
@@ -131,8 +127,24 @@ impl Adapter for Keenable {
         &SPEC
     }
 
+    fn keys(&self) -> Vec<String> {
+        super::keys_for(&self.ctx.config, &SPEC)
+    }
+
     fn is_configured(&self) -> bool {
-        !self.api_key().is_empty()
+        !self.keys().is_empty()
+    }
+
+    /// Keenable's errors page: 402 with the code `insufficient_credits` ("this
+    /// month's free requests and the purchased credits are used up"). Its
+    /// other 402 codes are the pay-per-request (x402, ZeroClick) paths, and a
+    /// 429 is a per-second rate limit: neither marks a key.
+    fn spent(&self, status: u16, body: &str) -> bool {
+        status == 402
+            && serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v["code"].as_str().map(|c| c == "insufficient_credits"))
+                .unwrap_or(false)
     }
 
     fn sent_cost(&self, _mode: Mode) -> u64 {
@@ -147,11 +159,11 @@ impl Adapter for Keenable {
         }
         let body = body(call);
         let client = &self.ctx.client;
-        let api_key = self.api_key();
+        let api_key = call.key;
         let resp = super::send(self, call.timeout, || {
             client
                 .post(ENDPOINT)
-                .header("X-API-Key", api_key.as_str())
+                .header("X-API-Key", api_key)
                 .json(&body)
         })
         .await?;
@@ -172,7 +184,22 @@ mod tests {
             count,
             opts,
             timeout: Duration::from_secs(5),
+            key: "",
         }
+    }
+
+    #[test]
+    fn only_insufficient_credits_marks_a_key() {
+        let k = Keenable::new(Arc::new(AppContext::new(
+            crate::config::AppConfig::default(),
+        )));
+        assert!(k.spent(402, r#"{"error":"Insufficient credits","type":"billing_error","code":"insufficient_credits","retryable":false}"#));
+        assert!(!k.spent(
+            402,
+            r#"{"error":"Payment required","type":"billing_error","code":"payment_required"}"#
+        ));
+        assert!(!k.spent(429, r#"{"error":"Rate limit exceeded","type":"rate_limit_error","code":"rate_limit_per_second"}"#));
+        assert!(!k.spent(401, r#"{"error":"Invalid key","code":"invalid_api_key"}"#));
     }
 
     #[test]
