@@ -136,18 +136,9 @@ impl KeyUse {
         // a rejected key (401), then "out of credit", which marked keys going
         // last often repeat. So the owner is told only when every key's cause
         // is the owner's (`errors::owner_note`).
-        let rank = |f: &ProviderFailure| {
-            if f.code == "credits_exhausted" {
-                2
-            } else if f.category == FailureCategory::Auth && f.http_status == Some(401) {
-                1
-            } else {
-                0
-            }
-        };
         let lead = std::iter::once(&last)
             .chain(self.refused.iter().rev().map(|(_, f)| f))
-            .min_by_key(|f| rank(f))
+            .min_by_key(|f| lead_rank(f))
             .map(|f| (f.category, f.code.clone(), f.http_status, f.retryable));
         if let Some((category, code, http_status, retryable)) = lead {
             last.category = category;
@@ -161,6 +152,19 @@ impl KeyUse {
             stopped
         };
         last
+    }
+}
+
+/// Which of several failures leads, lowest first: anything that is not the
+/// key's own fault (a rate limit, a timeout, …), then a rejected key (401),
+/// then "out of credit".
+fn lead_rank(f: &ProviderFailure) -> u8 {
+    if f.code == "credits_exhausted" {
+        2
+    } else if f.category == FailureCategory::Auth && f.http_status == Some(401) {
+        1
+    } else {
+        0
     }
 }
 
@@ -236,26 +240,16 @@ pub(crate) async fn execute_with(
     }
     // Several keyword queries: an engine that takes them all in one call
     // gets them so; every other engine runs one call per distinct query.
-    let mut distinct: Vec<&str> = vec![req.query];
-    for q in &req.opts.more_queries {
-        if !distinct.contains(&q.as_str()) {
-            distinct.push(q);
-        }
-    }
-    let queries = distinct.len();
-    let plan: Vec<Box<dyn Adapter>> = if queries == 1 {
-        plan
-    } else {
-        plan.into_iter()
-            .map(|a| {
-                if a.takes_several_queries() {
-                    a
-                } else {
-                    Box::new(EachQuery { inner: a, queries }) as Box<dyn Adapter>
-                }
-            })
-            .collect()
-    };
+    let queries = distinct_queries(req).len();
+    // With a goal, the engine that read the goal and every query in one
+    // call puts its first result first (`lead_first`).
+    let leader: Option<&'static str> = req
+        .opts
+        .goal
+        .is_some()
+        .then(|| plan.iter().find(|a| a.takes_several_queries()))
+        .flatten()
+        .map(|a| a.name());
 
     let names: Vec<&'static str> = plan.iter().map(|a| a.name()).collect();
     // Each provider's keys, for reporting the ones marked out of credit.
@@ -273,7 +267,14 @@ pub(crate) async fn execute_with(
     let sent_costs: HashMap<&'static str, u64> = plan
         .iter()
         .filter(|a| a.spec().billed_on_send)
-        .map(|a| (a.name(), a.sent_cost(mode)))
+        .map(|a| {
+            let calls = if a.takes_several_queries() {
+                1
+            } else {
+                queries
+            };
+            (a.name(), a.sent_cost(mode) * calls as u64)
+        })
         .collect();
     let mut transport: BTreeMap<String, String> = plan
         .iter()
@@ -422,7 +423,13 @@ pub(crate) async fn execute_with(
     // answering provider's rows and order as sent: rows may share a URL
     // (images from one page) or have none (places).
     let mut results = match mode_spec.merge {
-        MergeKind::Fused => fuse_rrf(buckets),
+        MergeKind::Fused => {
+            let first = leader
+                .and_then(|l| buckets.iter().find(|(name, _)| name == l))
+                .and_then(|(_, items)| items.first())
+                .map(|r| normalize_url(&r.url));
+            lead_first(fuse_rrf(buckets), first)
+        }
         MergeKind::Chain | MergeKind::Single => {
             buckets.into_iter().flat_map(|(_, items)| items).collect()
         }
@@ -442,9 +449,8 @@ pub(crate) async fn execute_with(
         });
     }
 
-    // -c is per query: several queries keep as many results as that many
-    // separate searches would (at most 100).
-    results.truncate(req.count.saturating_mul(queries).min(100));
+    // -c is the number of results shown, however many queries the search has.
+    results.truncate(req.count);
 
     if mode == Mode::Extract {
         // Scraped page content is untrusted input for the consuming agent —
@@ -576,141 +582,147 @@ const SECOND_ASK_MARGIN: Duration = Duration::from_millis(250);
 /// requests a second per organization).
 const QUERY_CONCURRENCY: usize = 4;
 
-/// An engine that takes one query per call, run once for each of a search's
-/// keyword queries ([`QUERY_CONCURRENCY`] at a time) with its lists fused,
-/// so the rest of the engine sees one call and one list.
-struct EachQuery {
-    inner: Box<dyn Adapter>,
-    /// How many queries the search has.
-    queries: usize,
+/// A search's distinct keyword queries, in the order given.
+fn distinct_queries(req: &Request<'_>) -> Vec<String> {
+    let mut distinct: Vec<String> = vec![req.query.to_string()];
+    for q in &req.opts.more_queries {
+        if !distinct.contains(q) {
+            distinct.push(q.clone());
+        }
+    }
+    distinct
 }
 
-impl EachQuery {
-    /// One query, cut off at `end` so the engine keeps what the other
-    /// queries found when one is slow; a cut-off is a timeout failure.
-    async fn one(
-        &self,
-        call: &Call<'_>,
-        place: usize,
-        query: &str,
-        end: Instant,
-    ) -> (usize, Result<Output, SearchError>) {
-        (place, self.run(call, query, end).await)
+/// One engine's part of a search. An engine that takes several keyword
+/// queries gets them all in one call; any other engine runs each query as
+/// its own call ([`run_each`]).
+async fn run_engine(
+    adapter: &dyn Adapter,
+    keys: Keys<'_>,
+    mode: Mode,
+    queries: &[String],
+    count: usize,
+    opts: &SearchOpts,
+    deadline: Instant,
+) -> (Outcome, KeyUse) {
+    if queries.len() > 1 && !adapter.takes_several_queries() {
+        run_each(adapter, keys, mode, queries, count, opts, deadline).await
+    } else {
+        run_one(adapter, keys, mode, &queries[0], count, opts, deadline).await
     }
+}
 
-    async fn run(&self, call: &Call<'_>, query: &str, end: Instant) -> Result<Output, SearchError> {
-        if Instant::now() >= end {
-            // Never sent, so never billed.
-            return Err(SearchError::Upstream {
-                provider: self.inner.name(),
-                status: 0,
-                category: FailureCategory::Other,
-                message: "not sent: the search's time was up".to_string(),
-            });
-        }
-        let one = Call {
-            query,
-            timeout: end.saturating_duration_since(Instant::now()),
-            ..*call
+/// An engine that takes one query per call, run once for each keyword query
+/// ([`QUERY_CONCURRENCY`] at a time). Each query is a call like a single
+/// search's: a key refused for it hands that query to the next key, and an
+/// empty answer is asked once more. The lists are fused, so the rest of the
+/// search sees one outcome per engine. Every query ends a little before the
+/// engine's own time is up, so the engine answers with what finished.
+async fn run_each(
+    adapter: &dyn Adapter,
+    keys: Keys<'_>,
+    mode: Mode,
+    queries: &[String],
+    count: usize,
+    opts: &SearchOpts,
+    deadline: Instant,
+) -> (Outcome, KeyUse) {
+    use futures_util::StreamExt;
+    let end = Instant::now() + time_left(deadline, adapter).saturating_sub(SECOND_ASK_MARGIN);
+    let calls: Vec<_> = queries
+        .iter()
+        .enumerate()
+        .map(|(place, query)| async move {
+            // A query whose turn comes after the time is up is never sent,
+            // so never billed.
+            if Instant::now() >= end {
+                return (place, None);
+            }
+            let ran = run_one(adapter, keys, mode, query, count, opts, end).await;
+            (place, Some(ran))
+        })
+        .collect();
+    // Unordered, so one slow query never holds back the ones after it;
+    // each answer keeps its place, so fusion order stays fixed.
+    let mut placed: Vec<(usize, Option<(Outcome, KeyUse)>)> = futures_util::stream::iter(calls)
+        .buffer_unordered(QUERY_CONCURRENCY)
+        .collect()
+        .await;
+    placed.sort_by_key(|(place, _)| *place);
+
+    let name = adapter.name();
+    let spec = adapter.spec();
+    let mut used = KeyUse {
+        of: keys.order.iter().filter(|s| s.place > 0).count(),
+        ..KeyUse::default()
+    };
+    let mut answered_with: Option<usize> = None;
+    let mut lists: Vec<(String, Vec<SearchResult>)> = Vec::new();
+    let mut out = Output::default();
+    let mut cost = 0;
+    let mut failures: Vec<ProviderFailure> = Vec::new();
+    let mut timed_out = false;
+    for (place, ran) in placed {
+        let label = format!("query {} ({})", place + 1, queries[place]);
+        let Some((outcome, one_used)) = ran else {
+            out.notes
+                .push(format!("{label} not sent: the search's time was up"));
+            continue;
         };
-        match tokio::time::timeout_at(end.into(), self.inner.call(&one)).await {
-            Ok(answer) => answer,
-            Err(_) => Err(providers::timeout_error(self.inner.name())),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Adapter for EachQuery {
-    fn spec(&self) -> &'static providers::ProviderSpec {
-        self.inner.spec()
-    }
-    fn is_configured(&self) -> bool {
-        self.inner.is_configured()
-    }
-    fn keys(&self) -> Vec<String> {
-        self.inner.keys()
-    }
-    fn classify(&self, status: u16, body: &str) -> Option<FailureCategory> {
-        self.inner.classify(status, body)
-    }
-    fn spent(&self, status: u16, body: &str) -> bool {
-        self.inner.spent(status, body)
-    }
-    fn sent_cost(&self, mode: Mode) -> u64 {
-        self.inner.sent_cost(mode) * self.queries as u64
-    }
-    fn transport(&self) -> crate::types::Transport {
-        self.inner.transport()
-    }
-    fn applied_filters(&self, opts: &SearchOpts) -> FilterSupport {
-        self.inner.applied_filters(opts)
-    }
-    async fn call(&self, call: &Call<'_>) -> Result<Output, SearchError> {
-        let mut queries: Vec<&str> = vec![call.query];
-        for q in &call.opts.more_queries {
-            if !queries.contains(&q.as_str()) {
-                queries.push(q);
+        used.tried = used.tried.max(one_used.tried);
+        used.asked_again |= one_used.asked_again;
+        used.answered_marked = used.answered_marked.or(one_used.answered_marked);
+        for (slot, f) in one_used.refused {
+            if !used.refused.iter().any(|(s, _)| *s == slot) {
+                used.refused.push((slot, f));
             }
         }
-        use futures_util::StreamExt;
-        // Every query ends before the call's own time is up, so the engine
-        // answers with what finished instead of being cut off as a whole.
-        let end = Instant::now() + call.timeout.saturating_sub(SECOND_ASK_MARGIN);
-        let mut calls = Vec::with_capacity(queries.len());
-        for (place, q) in queries.iter().enumerate() {
-            calls.push(self.one(call, place, q, end));
-        }
-        // Unordered, so one slow query never holds back the ones after it;
-        // each answer keeps its place, so fusion order stays fixed.
-        let mut placed: Vec<(usize, Result<Output, SearchError>)> =
-            futures_util::stream::iter(calls)
-                .buffer_unordered(QUERY_CONCURRENCY)
-                .collect()
-                .await;
-        placed.sort_by_key(|(place, _)| *place);
-        let answers = placed.into_iter().map(|(_, a)| a);
-        let name = self.inner.name();
-        let mut lists: Vec<(String, Vec<SearchResult>)> = Vec::new();
-        let mut out = Output::default();
-        let mut cost = 0;
-        let mut failed: Vec<SearchError> = Vec::new();
-        for (i, answer) in answers.into_iter().enumerate() {
-            match answer {
-                Ok(one) => {
-                    let n = one.results.len() as u16;
-                    cost += one
-                        .cost_micros
-                        .unwrap_or_else(|| self.spec().price.estimate(n));
-                    out.answers.extend(one.answers);
-                    out.notes.extend(one.notes);
-                    lists.push((name.to_string(), one.results));
+        match outcome {
+            Outcome::Done(one) | Outcome::Rejected(_, one) => {
+                answered_with = answered_with.max(Some(one_used.last));
+                cost += one
+                    .cost_micros
+                    .unwrap_or_else(|| spec.price.estimate(one.results.len() as u16));
+                out.answers.extend(one.answers);
+                out.notes.extend(one.notes);
+                lists.push((name.to_string(), one.results));
+            }
+            Outcome::Failed(f) => {
+                // A billed failure (an unreadable answer, …) still costs its call.
+                if providers::billed_failure(f.category) && spec.billed_on_send {
+                    cost += adapter.sent_cost(mode);
                 }
-                Err(e) => {
-                    // A billed failure (a timeout, an unreadable answer) still
-                    // costs its call.
-                    if providers::billed_failure(e.category()) && self.spec().billed_on_send {
-                        cost += self.inner.sent_cost(call.mode);
-                    }
-                    out.notes
-                        .push(format!("query {} ({}) failed: {e}", i + 1, queries[i]));
-                    failed.push(e);
+                out.notes.push(format!("{label} failed: {}", f.reason));
+                used.last = used.last.max(one_used.last);
+                failures.push(f);
+            }
+            Outcome::TimedOut => {
+                if spec.billed_on_send {
+                    cost += adapter.sent_cost(mode);
                 }
+                out.notes
+                    .push(format!("{label} was still running when its time was up"));
+                timed_out = true;
             }
         }
-        if lists.is_empty() {
-            // Every query failed: the failure a next key may cure leads, so
-            // key rotation still works.
-            let at = failed
-                .iter()
-                .position(|e| providers::next_key_may_help(e.category()))
-                .unwrap_or(0);
-            return Err(failed.swap_remove(at));
-        }
-        out.results = fuse_rrf(lists);
-        out.cost_micros = Some(cost);
-        Ok(out)
     }
+    if lists.is_empty() {
+        // Nothing answered. The cause that leads is the one the owner cannot
+        // act on, as with one query's keys (`KeyUse::failure`): a timeout or
+        // any other failure before a rejected key, before "out of credit".
+        // Nothing sent at all counts as a timeout too.
+        let outcome = match failures.into_iter().min_by_key(lead_rank) {
+            Some(f) if !timed_out || lead_rank(&f) == 0 => Outcome::Failed(f),
+            _ => Outcome::TimedOut,
+        };
+        return (outcome, used);
+    }
+    if let Some(slot) = answered_with {
+        used.last = slot;
+    }
+    out.results = fuse_rrf(lists);
+    out.cost_micros = Some(cost);
+    (Outcome::Done(out), used)
 }
 
 /// The web search modes: an empty answer from an engine is unusual there, so
@@ -727,6 +739,7 @@ const ASK_AGAIN_MODES: &[Mode] = WEB_MODES;
 
 /// A call's keys in the order to try them, and where it notes what it
 /// learns about marked keys.
+#[derive(Clone, Copy)]
 struct Keys<'a> {
     order: &'a [Slot],
     learned: &'a Mutex<spent::Changes>,
@@ -883,19 +896,19 @@ async fn run_fused(
         let order = key_order(adapter.as_ref(), req.spent, now);
         let name = adapter.name();
         pending.push(name);
-        let query = req.query.to_string();
+        let queries = distinct_queries(req);
         let opts = req.opts.clone();
         let count = req.count;
         let learned = learned.clone();
         let handle = set.spawn(async move {
-            let (outcome, keys) = run_one(
+            let (outcome, keys) = run_engine(
                 adapter.as_ref(),
                 Keys {
                     order: &order,
                     learned: &learned,
                 },
                 mode,
-                &query,
+                &queries,
                 count,
                 &opts,
                 deadline,
@@ -1054,6 +1067,22 @@ fn no_providers_error(mode: Mode, only: Option<&[String]>) -> SearchError {
         },
         None => SearchError::NoProviders(mode.to_string()),
     }
+}
+
+/// Moves the fused row of the leading engine's first result (by its URL
+/// key) to the top; the rest keep their fused order. With a goal, the
+/// engine that read the goal and every query in one call (Parallel) put the
+/// original source first more often than the fusion did (round 10: 74% of
+/// searches against 50%), while the other engines' lists still add what it
+/// lacks below it. Without its answer (it failed), the fusion stands.
+fn lead_first(mut fused: Vec<SearchResult>, first: Option<String>) -> Vec<SearchResult> {
+    let Some(key) = first.filter(|k| !k.is_empty()) else {
+        return fused;
+    };
+    if let Some(at) = fused.iter().position(|r| normalize_url(&r.url) == key) {
+        fused[..=at].rotate_right(1);
+    }
+    fused
 }
 
 /// Reciprocal rank fusion across provider buckets. Each URL scores
@@ -2115,6 +2144,8 @@ mod tests {
         hanging: Vec<&'static str>,
         /// How long each answer takes.
         delay: Duration,
+        /// Its keys; with keys, `failing` queries fail on the first key only.
+        keys: Vec<&'static str>,
     }
 
     #[async_trait::async_trait]
@@ -2128,6 +2159,9 @@ mod tests {
         fn takes_several_queries(&self) -> bool {
             self.several
         }
+        fn keys(&self) -> Vec<String> {
+            self.keys.iter().map(|k| k.to_string()).collect()
+        }
         async fn call(&self, call: &Call<'_>) -> Result<Output, SearchError> {
             self.seen.lock().unwrap().push((
                 call.query.to_string(),
@@ -2138,7 +2172,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             tokio::time::sleep(self.delay).await;
-            if self.failing.contains(&call.query) {
+            let first_key = self.keys.first().is_none_or(|k| *k == call.key);
+            if self.failing.contains(&call.query) && first_key {
                 return Err(SearchError::Upstream {
                     provider: self.spec.name,
                     status: 429,
@@ -2175,6 +2210,7 @@ mod tests {
             failing: failing.to_vec(),
             hanging: Vec::new(),
             delay: Duration::ZERO,
+            keys: Vec::new(),
         };
         (Box::new(a), seen)
     }
@@ -2225,6 +2261,7 @@ mod tests {
             failing: Vec::new(),
             hanging: vec!["kw four"],
             delay: Duration::from_millis(10),
+            keys: Vec::new(),
         }) as Box<dyn Adapter>;
         let resp = search_queries_within(
             vec![exa],
@@ -2247,6 +2284,7 @@ mod tests {
             failing: Vec::new(),
             hanging: vec!["b1"],
             delay: Duration::from_millis(10),
+            keys: Vec::new(),
         }) as Box<dyn Adapter>;
         let resp =
             search_queries_within(vec![exa], &["b1", "b2", "b3", "b4", "b5"], None, 10, 1_000)
@@ -2263,6 +2301,7 @@ mod tests {
             failing: Vec::new(),
             hanging: Vec::new(),
             delay: Duration::from_millis(300),
+            keys: Vec::new(),
         }) as Box<dyn Adapter>;
         let resp = search_queries_within(vec![exa], &["a1", "a2", "a3", "a4", "a5"], None, 10, 700)
             .await
@@ -2295,7 +2334,7 @@ mod tests {
 
     /// Several keyword queries: an engine that takes them all gets one call
     /// with the goal; every other engine runs each query once, and the lists
-    /// are fused into one result list sized per query.
+    /// are fused into one result list of -c results.
     #[tokio::test]
     async fn several_queries_make_one_search() {
         let (par, par_seen) = query_log(&parallel::SPEC, true, &[]);
@@ -2320,8 +2359,8 @@ mod tests {
             .collect();
         exa_queries.sort();
         assert_eq!(exa_queries, ["kw one", "kw three", "kw two"], "each once");
-        // -c 2 per distinct query over 3 queries keeps up to 6 results.
-        assert_eq!(resp.results.len(), 6);
+        // -c is the number shown, however many queries.
+        assert_eq!(resp.results.len(), 2);
         assert_eq!(resp.metadata.provider_results["exa"], 9);
         let cost = resp.metadata.cost.unwrap().by_provider;
         assert_eq!((cost["exa"], cost["parallel"]), (3_000, 1_000));
@@ -2352,6 +2391,88 @@ mod tests {
             panic!()
         };
         assert_eq!(failed[0].category, FailureCategory::RateLimit);
+    }
+
+    /// A key refused for one of several queries hands that query to the next
+    /// key, as in a single search; the other queries stay on the first key.
+    #[tokio::test]
+    async fn a_key_refused_for_one_query_hands_it_to_the_next_key() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let exa = Box::new(QueryLog {
+            spec: &exa::SPEC,
+            several: false,
+            seen: seen.clone(),
+            failing: vec!["kw two"],
+            hanging: Vec::new(),
+            delay: Duration::ZERO,
+            keys: vec![K1, K2],
+        }) as Box<dyn Adapter>;
+        let resp = search_queries(vec![exa], &["kw one", "kw two", "kw three"], None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.provider_results["exa"], 9,
+            "all three queries"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4, "kw two sent twice");
+        assert_eq!(resp.metadata.key_slots.get("exa"), Some(&2));
+        assert!(resp.metadata.providers_failed.is_empty());
+        let cost = resp.metadata.cost.unwrap().by_provider;
+        assert_eq!(cost["exa"], 3_000, "the refusal is not billed");
+    }
+
+    /// With a goal, Parallel's first result leads; the rest is the fusion.
+    /// Without a goal, or when Parallel fails, the fusion stands.
+    #[tokio::test]
+    async fn with_a_goal_parallels_first_result_leads() {
+        let queries = ["kw one", "kw two"];
+        let top = |resp: &SearchResponse| resp.results[0].url.clone();
+        let (par, _) = query_log(&parallel::SPEC, true, &[]);
+        let (exa, _) = query_log(&exa::SPEC, false, &[]);
+        let resp = search_queries(vec![exa, par], &queries, Some("the question"), 10)
+            .await
+            .unwrap();
+        assert_eq!(top(&resp), "https://parallel.example/kwone/0");
+        assert_eq!(resp.results[1].url, "https://exa.example/kwone/0");
+        assert_eq!(resp.results.len(), 9);
+
+        let (par, _) = query_log(&parallel::SPEC, true, &[]);
+        let (exa, _) = query_log(&exa::SPEC, false, &[]);
+        let resp = search_queries(vec![exa, par], &queries, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(top(&resp), "https://exa.example/kwone/0", "no goal: fusion");
+
+        let (par, _) = query_log(&parallel::SPEC, true, &["kw one"]);
+        let (exa, _) = query_log(&exa::SPEC, false, &[]);
+        let resp = search_queries(vec![exa, par], &queries, Some("the question"), 10)
+            .await
+            .unwrap();
+        assert_eq!(top(&resp), "https://exa.example/kwone/0", "Parallel failed");
+    }
+
+    #[test]
+    fn the_leading_row_moves_up_and_keeps_its_votes() {
+        let rows = |urls: &[&str]| urls.iter().map(|u| result(u, "exa")).collect::<Vec<_>>();
+        let fused = lead_first(
+            rows(&[
+                "https://a.example/",
+                "https://b.example/",
+                "https://c.example/",
+            ]),
+            Some(normalize_url("http://www.c.example")),
+        );
+        let urls: Vec<&str> = fused.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://c.example/",
+                "https://a.example/",
+                "https://b.example/"
+            ]
+        );
+        let same = lead_first(rows(&["https://a.example/"]), Some("z.example".into()));
+        assert_eq!(same[0].url, "https://a.example/");
     }
 
     /// One query without --goal is the search it always was.

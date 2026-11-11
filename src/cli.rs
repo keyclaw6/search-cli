@@ -236,7 +236,7 @@ pub struct SearchArgs {
     #[arg(long, hide = true)]
     pub no_rerank: bool,
 
-    /// Number of results to return
+    /// Number of results to return, for the whole search however many -q
     #[arg(short, long)]
     pub count: Option<usize>,
 

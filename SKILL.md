@@ -26,7 +26,7 @@ exit code.
 For a question, give the question and a few short keyword queries in one
 search: `search search -m general -c 10 --goal "<the question>" -q "<kw 1>" -q "<kw 2>"`.
 Parallel gets the question and every query in one call; the other engines run
-each query; all results come back fused as one list (`-c` per query).
+each query; all results come back fused as one list of `-c` results.
 
 ## Choosing a mode
 
