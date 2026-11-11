@@ -98,9 +98,18 @@ fn body(call: &Call<'_>) -> Value {
     if let Some(country) = &opts.country {
         advanced["location"] = json!(country.to_ascii_lowercase());
     }
+    // With several keyword queries Parallel gets them all in one call, and
+    // the goal (when given) as the objective: its own recommended shape.
+    let mut queries: Vec<String> = Vec::new();
+    for q in std::iter::once(call.query).chain(opts.more_queries.iter().map(String::as_str)) {
+        let q = keyword_query(q);
+        if !queries.contains(&q) {
+            queries.push(q);
+        }
+    }
     json!({
-        "objective": call.query,
-        "search_queries": [keyword_query(call.query)],
+        "objective": opts.goal.as_deref().unwrap_or(call.query),
+        "search_queries": queries,
         "mode": if call.mode == Mode::News { "fast" } else { "advanced" },
         "advanced_settings": advanced,
     })
@@ -219,6 +228,10 @@ impl Adapter for Parallel {
 
     fn sent_cost(&self, mode: Mode) -> u64 {
         price(mode).estimate(0)
+    }
+
+    fn takes_several_queries(&self) -> bool {
+        true
     }
 
     async fn call(&self, call: &Call<'_>) -> Result<Output, SearchError> {
@@ -348,6 +361,28 @@ mod tests {
                 serde_json::from_str(&format!(r#"{{"results":[],"warnings":{odd}}}"#)).unwrap();
             let _ = parse(data, &call(Mode::General, 10, &opts));
         }
+    }
+
+    /// Several keyword queries go in one call, each at most 200 characters
+    /// and none twice, with the goal as the objective.
+    #[test]
+    fn several_queries_go_in_one_call_with_the_goal() {
+        let opts = SearchOpts {
+            goal: Some("Which Gemini model topped Artificial Analysis in November 2026?".into()),
+            more_queries: vec!["Gemini 4 Carbon index".into(), "rust async runtime".into()],
+            ..SearchOpts::default()
+        };
+        let b = body(&call(Mode::General, 10, &opts));
+        assert_eq!(
+            b["objective"],
+            "Which Gemini model topped Artificial Analysis in November 2026?"
+        );
+        assert_eq!(
+            b["search_queries"],
+            json!(["rust async runtime", "Gemini 4 Carbon index"])
+        );
+        let p = Parallel::new(Arc::new(AppContext::new(AppConfig::default())));
+        assert!(p.takes_several_queries());
     }
 
     /// A query over 200 characters goes whole into `objective`, and its

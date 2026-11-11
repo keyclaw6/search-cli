@@ -100,6 +100,7 @@ const GLOBAL_FLAG_TOKENS: &[&str] = &[
 const SEARCH_FLAG_TOKENS: &[&str] = &[
     "-q",
     "--query",
+    "--goal",
     "-m",
     "--mode",
     "-p",
@@ -294,6 +295,8 @@ fn apply_max_chars(response: &mut types::SearchResponse, max_chars: Option<usize
 /// SearchArgs for the bare `search "query"` shorthand: auto mode, defaults.
 fn default_search_args(query: String) -> cli::SearchArgs {
     cli::SearchArgs {
+        queries: vec![query.clone()],
+        goal: None,
         query,
         mode: cli::ModeArg::Auto,
         no_rerank: false,
@@ -435,7 +438,7 @@ fn agent_info(app: &Arc<AppContext>) -> serde_json::Value {
         "name": "search",
         "version": env!("CARGO_PKG_VERSION"),
         "description": env!("CARGO_PKG_DESCRIPTION"),
-        "usage": "search \"<query>\" | search search -q <query|url> [-m auto|<mode>] [-p a,b] [-c N] [-f day|week|month|year] [-d dom,..] [--exclude-domain dom,..] [--country cc] [--lang ll] [--no-cache] [--max-chars N] [--allow-private]",
+        "usage": "search \"<query>\" | search search -q <query|url> [-q <query>]... [--goal <question>] [-m auto|<mode>] [-p a,b] [-c N] [-f day|week|month|year] [-d dom,..] [--exclude-domain dom,..] [--country cc] [--lang ll] [--no-cache] [--max-chars N] [--allow-private]",
         "commands": {
             "search": "Search (default). -q is a URL in extract/scrape/similar",
             "doctor": "One billed test call per configured provider",
@@ -525,6 +528,13 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
 
     match command {
         Commands::Search(mut args) => {
+            // The first -q is the query; any further -q and --goal make one
+            // search over several keyword queries.
+            if let Some(first) = args.queries.first() {
+                args.query = first.clone();
+            }
+            let more_queries: Vec<String> = args.queries.iter().skip(1).cloned().collect();
+            let several = !more_queries.is_empty() || args.goal.is_some();
             // --x flag: force X/Twitter search via xAI Grok
             if cli.x_only {
                 args.mode = cli::ModeArg::Fixed(types::Mode::Social);
@@ -592,7 +602,9 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 }
                 Ok(err.exit_code())
             };
-            if args.query.trim().is_empty() {
+            if args.queries.iter().any(|q| q.trim().is_empty())
+                || args.goal.as_deref().is_some_and(|g| g.trim().is_empty())
+            {
                 return bail(
                     errors::SearchError::InvalidInput {
                         message: "query is empty".to_string(),
@@ -600,7 +612,12 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                     ctx,
                 );
             }
-            if args.query.chars().count() > 2000 {
+            if args
+                .queries
+                .iter()
+                .chain(&args.goal)
+                .any(|q| q.chars().count() > 2000)
+            {
                 return bail(
                     errors::SearchError::InvalidInput {
                         message: "query exceeds 2000 characters".to_string(),
@@ -646,6 +663,8 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 freshness: args.freshness,
                 country: args.country.clone(),
                 lang: args.lang.clone(),
+                goal: args.goal.clone(),
+                more_queries,
             };
 
             // Query cache (5min TTL). Only plain searches share it — any
@@ -656,7 +675,8 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             // requested mode and how each provider would be reached, so a
             // new key never replays a run that went another way.
             let cache_mode = format!("{}|{}", args.mode, transport_signature(&app));
-            let cacheable = args.providers.is_none()
+            let cacheable = !several
+                && args.providers.is_none()
                 && opts.include_domains.is_empty()
                 && opts.exclude_domains.is_empty()
                 && opts.freshness.is_none()
@@ -678,7 +698,12 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             }
 
             // auto: decisive rules, then the signal rules, then general. An
-            // explicit -m is obeyed as given.
+            // explicit -m is obeyed as given. A search over several queries
+            // or with a goal is a web search: auto would route it on its first
+            // query alone, so it is general.
+            if several && matches!(args.mode, cli::ModeArg::Auto) {
+                args.mode = cli::ModeArg::Fixed(types::Mode::General);
+            }
             let mut query = args.query.clone();
             let (mode, auto) = match args.mode {
                 cli::ModeArg::Fixed(m) => (m, None),
@@ -723,6 +748,16 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             // query — fail fast (exit 3) instead of feeding a text query to
             // paid scrapers as if it were an address.
             let spec = registry::spec(mode);
+            if several && !engine::WEB_MODES.contains(&mode) {
+                return bail(
+                    errors::SearchError::InvalidInput {
+                        message: format!(
+                            "several -q and --goal work in the web search modes (general, news, academic, deep, scholar), not in '{mode}'"
+                        ),
+                    },
+                    ctx,
+                );
+            }
             if spec.input == registry::InputKind::Url {
                 query = query.trim().to_string();
             }

@@ -868,3 +868,73 @@ fn retired_account_commands_are_refused_not_searched() {
         assert!(stdout.contains("invalid_input"), "{args:?}: {stdout}");
     }
 }
+
+/// Several -q with --goal make one search (here with no keys, so it ends
+/// as "no providers", not as a parse error); with a URL mode, or with an
+/// empty query, they are refused before any call (exit 3).
+#[test]
+fn several_queries_and_a_goal_are_one_search() {
+    let out = offline_cmd("multi")
+        .args([
+            "search",
+            "-q",
+            "kw one",
+            "-q",
+            "kw two",
+            "--goal",
+            "the question",
+            "-m",
+            "general",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["error"]["code"], "no_providers", "{json}");
+    for args in [
+        &[
+            "search",
+            "-q",
+            "https://example.com/",
+            "-q",
+            "kw",
+            "-m",
+            "extract",
+        ][..],
+        &["search", "-q", "kw one", "-q", " ", "-m", "general"],
+        &["search", "-q", "kw one", "--goal", "", "-m", "general"],
+    ] {
+        let out = offline_cmd("multi").args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+    }
+}
+
+/// A search over several queries is a web search: without -m it is
+/// general, never routed on its first query alone; in a mode where rows
+/// share URLs (images, places) it is refused before any call.
+#[test]
+fn several_queries_search_the_web_modes_only() {
+    let out = offline_cmd("multiweb")
+        .args([
+            "search",
+            "-q",
+            "reddit nix flakes",
+            "-q",
+            "nix flakes lock",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("general"),
+        "routed on the first query: {text}"
+    );
+    for mode in ["images", "places", "community", "social"] {
+        let out = offline_cmd("multiweb")
+            .args(["search", "-q", "a", "-q", "b", "-m", mode])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{mode}");
+    }
+}

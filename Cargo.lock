@@ -22,6 +22,7 @@ dependencies = [
  "dom_smoothie",
  "encoding_rs",
  "figment",
+ "futures-util",
  "hickory-resolver",
  "http-body-util",
  "indicatif",

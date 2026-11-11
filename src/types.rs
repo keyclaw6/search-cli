@@ -251,6 +251,11 @@ pub struct ResponseMetadata {
     /// and filter notes. Written to the search log, never printed.
     #[serde(default, skip_serializing)]
     pub diagnostics: Vec<String>,
+    /// For the search log: the keyword queries after the first, and the goal.
+    #[serde(default, skip_serializing)]
+    pub more_queries: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub goal: Option<String>,
     /// One plain sentence to pass to the owner when an engine needs them
     /// (every key rejected or out of credit). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +332,11 @@ pub struct SearchOpts {
     pub country: Option<String>,
     /// Language code (e.g. "de"); applied by serper/serpapi (hl) and brave.
     pub lang: Option<String>,
+    /// The question several keyword queries serve (`--goal`).
+    pub goal: Option<String>,
+    /// Keyword queries after the first (`-q` given again): engines that take
+    /// several queries get them in one call, the others one call each.
+    pub more_queries: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

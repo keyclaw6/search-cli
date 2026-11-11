@@ -155,6 +155,12 @@ fn parse(mode: Mode, exa: ExaResponse) -> Output {
     }
 }
 
+/// At most this many results in general and deep: results 11-20 never held
+/// an original source the first ten missed (round 9, 64 general searches)
+/// and cost about $0.01 a search more. The Exa-only modes (people, similar,
+/// academic) were not measured and keep the full count.
+const WEB_MAX: u16 = 10;
+
 /// The path and body for one call. Search modes buy highlights only (full
 /// text was billed and thrown away); people and similar buy clipped text.
 /// People sends no domain or date filters (Exa answers 400 to them with
@@ -175,9 +181,14 @@ fn body(call: &Call<'_>) -> (&'static str, serde_json::Value) {
             json!({ "url": call.query, "numResults": call.count, "contents": text }),
         ),
         mode => {
+            let count = if matches!(mode, Mode::General | Mode::Deep) {
+                call.count.min(WEB_MAX)
+            } else {
+                call.count
+            };
             let mut body = json!({
                 "query": call.query,
-                "numResults": call.count,
+                "numResults": count,
                 "type": if mode == Mode::Deep { "deep" } else { "auto" },
                 "contents": highlights,
             });
@@ -294,6 +305,26 @@ mod tests {
     }
 
     /// Exa's warnings and notices are kept for the search log.
+    /// General and deep ask for at most 10 results; the Exa-only modes
+    /// keep the full count.
+    #[test]
+    fn web_modes_ask_for_ten_at_most() {
+        let opts = SearchOpts::default();
+        let n = |mode: Mode| {
+            let call = Call {
+                mode,
+                query: "q",
+                count: 20,
+                opts: &opts,
+                timeout: Duration::from_secs(1),
+                key: "",
+            };
+            body(&call).1["numResults"].as_u64().unwrap()
+        };
+        assert_eq!((n(Mode::General), n(Mode::Deep)), (10, 10));
+        assert_eq!((n(Mode::Academic), n(Mode::People)), (20, 20));
+    }
+
     #[test]
     fn warnings_and_notices_become_notes() {
         let data: ExaResponse = serde_json::from_str(
@@ -314,7 +345,7 @@ mod tests {
         assert!(req.headers().contains_key("x-api-key"));
         assert_eq!(
             general,
-            json!({"query": "rust async", "numResults": 12, "type": "auto", "contents": {"highlights": true}})
+            json!({"query": "rust async", "numResults": 10, "type": "auto", "contents": {"highlights": true}})
         );
         let (_, academic) = sent(Mode::Academic, &none);
         assert_eq!(academic["category"], "publication");

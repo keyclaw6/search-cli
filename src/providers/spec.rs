@@ -98,6 +98,11 @@ pub trait Adapter: Send + Sync {
     fn spent(&self, _status: u16, _body: &str) -> bool {
         false
     }
+    /// Takes a search's several keyword queries (`opts.more_queries`) and its
+    /// goal in one call; otherwise the engine runs one call per query.
+    fn takes_several_queries(&self) -> bool {
+        false
+    }
     /// What one call in `mode` costs once sent, before any answer: the price
     /// of a call that times out or whose 2xx fails to parse. Override when a
     /// mode sends more than the base call (Tavily's advanced depth, Brave

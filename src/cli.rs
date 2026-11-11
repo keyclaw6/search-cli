@@ -111,6 +111,8 @@ pub struct Cli {
     pub debug: bool,
 }
 
+// SearchArgs is parsed once per run; boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Commands {
     /// Search across providers (use -m for mode, -p to pick providers)
@@ -206,8 +208,19 @@ pub struct VerifyArgs {
 
 #[derive(Parser)]
 pub struct SearchArgs {
-    /// Search query
-    #[arg(short, long)]
+    /// Search query. Give -q several times for one search over several
+    /// short keyword queries (results fused as one search)
+    #[arg(short = 'q', long = "query", value_name = "QUERY", required = true)]
+    pub queries: Vec<String>,
+
+    /// The question the -q keyword queries serve, in plain words. Parallel
+    /// searches with it and every query in one call; the other engines run
+    /// each -q
+    #[arg(long)]
+    pub goal: Option<String>,
+
+    /// The first -q (set from `queries`).
+    #[arg(skip)]
     pub query: String,
 
     /// Search mode (default: auto). auto picks one of general, news,

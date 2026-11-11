@@ -54,6 +54,8 @@ pub fn log_search(response: &SearchResponse) {
         "ts": now,
         "status": response.status,
         "query": response.query,
+        "more_queries": response.metadata.more_queries,
+        "goal": response.metadata.goal,
         "mode": response.mode,
         "result_count": response.metadata.result_count,
         "elapsed_ms": response.metadata.elapsed_ms,

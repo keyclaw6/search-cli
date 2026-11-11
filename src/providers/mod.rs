@@ -345,6 +345,8 @@ pub static NO_FILTERS: crate::types::SearchOpts = crate::types::SearchOpts {
     freshness: None,
     country: None,
     lang: None,
+    goal: None,
+    more_queries: Vec::new(),
 };
 
 /// Append `site:` / `-site:` operators for providers without native domain filters.
