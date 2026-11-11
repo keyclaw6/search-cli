@@ -70,6 +70,10 @@ pub struct Output {
     pub answers: Vec<Answer>,
     /// Upstream-reported cost of this call in micro-USD, when the response carries it.
     pub cost_micros: Option<u64>,
+    /// What the provider said about the request beside its results (its
+    /// warnings and notices): written to the search log for maintainers,
+    /// never put in front of the caller.
+    pub notes: Vec<String>,
 }
 
 #[async_trait]

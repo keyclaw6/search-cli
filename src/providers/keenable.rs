@@ -76,6 +76,9 @@ fn body(call: &Call<'_>) -> Value {
 struct KeenableResponse {
     #[serde(default)]
     results: Vec<KeenableResult>,
+    /// Set when the request was not answered as a plain search.
+    #[serde(default)]
+    warning: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +121,7 @@ fn parse(data: KeenableResponse, call: &Call<'_>) -> Output {
         results,
         answers: Vec::new(),
         cost_micros: Some(PRO.estimate(call.count)),
+        notes: super::note_messages(&data.warning),
     }
 }
 

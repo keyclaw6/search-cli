@@ -247,6 +247,14 @@ pub struct ResponseMetadata {
     /// Plain one-line notes for the caller (not problems; see `warnings`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// For maintainers: providers' own warnings and notices, key handling
+    /// and filter notes. Written to the search log, never printed.
+    #[serde(default, skip_serializing)]
+    pub diagnostics: Vec<String>,
+    /// One plain sentence to pass to the owner when an engine needs them
+    /// (every key rejected or out of credit). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_owner: Option<String>,
 }
 
 /// What the CLI decided on the caller's behalf.
@@ -341,6 +349,9 @@ pub struct ErrorDetail {
     /// What the failed run still cost (billed timeouts, rejected pages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<CostSummary>,
+    /// One plain sentence to pass to the owner (see `metadata.for_owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_owner: Option<String>,
     /// Keys marked out of credit (see `metadata.out_of_credit_keys`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_of_credit_keys: Vec<crate::spent::SpentKey>,

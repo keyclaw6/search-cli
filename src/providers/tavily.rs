@@ -150,6 +150,7 @@ fn parse(mode: Mode, resp: TavilyResponse) -> Output {
         results,
         answers,
         cost_micros: Some(reported.unwrap_or_else(|| depth_micros(mode))),
+        notes: Vec::new(),
     }
 }
 

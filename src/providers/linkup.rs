@@ -120,6 +120,7 @@ fn parse(data: LinkupResponse, mode: Mode) -> Output {
         results,
         answers: Vec::new(),
         cost_micros: Some(cost(mode)),
+        notes: Vec::new(),
     }
 }
 

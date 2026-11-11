@@ -65,6 +65,12 @@ struct ExaResponse {
     results: Option<Vec<ExaResult>>,
     #[serde(rename = "costDollars")]
     cost_dollars: Option<CostDollars>,
+    /// About the request (an ignored field, …).
+    #[serde(default)]
+    warnings: serde_json::Value,
+    /// About how the results were produced.
+    #[serde(default)]
+    notices: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +114,8 @@ fn clip(s: &str) -> String {
 /// Results plus the cost: Exa's own `costDollars.total` when present, else
 /// the list price for the type that was sent (only deep differs from SPEC).
 fn parse(mode: Mode, exa: ExaResponse) -> Output {
+    let mut notes = super::note_messages(&exa.warnings);
+    notes.extend(super::note_messages(&exa.notices));
     let results: Vec<SearchResult> = exa
         .results
         .unwrap_or_default()
@@ -143,6 +151,7 @@ fn parse(mode: Mode, exa: ExaResponse) -> Output {
         results,
         answers: Vec::new(),
         cost_micros,
+        notes,
     }
 }
 
@@ -282,6 +291,19 @@ mod tests {
             freshness: Some("week".into()),
             ..SearchOpts::default()
         }
+    }
+
+    /// Exa's warnings and notices are kept for the search log.
+    #[test]
+    fn warnings_and_notices_become_notes() {
+        let data: ExaResponse = serde_json::from_str(
+            r#"{"results":[],"warnings":[{"code":"IGNORED_FIELD","path":"/x","message":"x has no effect"}],"notices":[{"code":"RESTRICTIONS_RELAXED","path":"/query","message":"Restrictions were relaxed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse(Mode::General, data).notes,
+            ["x has no effect", "Restrictions were relaxed"]
+        );
     }
 
     #[test]

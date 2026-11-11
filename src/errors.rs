@@ -203,6 +203,21 @@ impl SearchError {
         }
     }
 
+    /// What a caller is shown as the error: for a search no engine could
+    /// answer, one plain sentence naming each engine and why.
+    fn plain_message(&self) -> String {
+        match self {
+            Self::AllProvidersFailed { failed, .. } => {
+                let each: Vec<String> = failed
+                    .iter()
+                    .map(|f| format!("{} ({})", f.provider, plain_cause(f)))
+                    .collect();
+                format!("No search engine could answer: {}.", each.join(", "))
+            }
+            other => redact_secrets(&other.to_string()),
+        }
+    }
+
     pub fn to_error_response(&self) -> ErrorResponse {
         let (provider_failures, cost, out_of_credit_keys) = match self {
             Self::AllProvidersFailed {
@@ -217,10 +232,18 @@ impl SearchError {
             status: "error".to_string(),
             error: ErrorDetail {
                 code: self.error_code().to_string(),
-                message: redact_secrets(&self.to_string()),
-                suggestion: self.suggestion(),
+                message: self.plain_message(),
+                // A total failure's sentence is the message (and for_owner).
+                suggestion: match self {
+                    Self::AllProvidersFailed { .. } => None,
+                    _ => self.suggestion(),
+                },
                 provider_failures,
                 cost,
+                for_owner: match self {
+                    Self::AllProvidersFailed { failed, .. } => owner_note(failed),
+                    _ => None,
+                },
                 out_of_credit_keys,
             },
         }
@@ -410,6 +433,71 @@ fn redact_words(s: &str) -> String {
     }
     flush(&mut word, &mut out);
     out
+}
+
+/// A failure's cause in a few plain words.
+fn plain_cause(f: &ProviderFailure) -> &'static str {
+    use FailureCategory::*;
+    if f.code == "credits_exhausted" {
+        return "out of credit";
+    }
+    match f.category {
+        Auth => "key rejected",
+        BillingQuota => "billing or quota refusal",
+        RateLimit => "rate limited",
+        Timeout => "timed out",
+        Network => "network error",
+        Server => "server error",
+        BadRequest => "bad request",
+        Parse => "unreadable answer",
+        Config => "not set up",
+        Rejected => "unusable page",
+        Other => "failed",
+    }
+}
+
+/// One plain sentence for the owner when an engine failed in a way only
+/// the owner can fix, and every one of its keys was tried: the provider
+/// answered "out of credit" (`credits_exhausted`) or rejected the key (401).
+/// An ambiguous quota answer, a 403 or an engine without keys never counts.
+pub fn owner_note(failed: &[ProviderFailure]) -> Option<String> {
+    let parts: Vec<String> = failed
+        .iter()
+        .filter(|f| {
+            crate::providers::find(&f.provider).is_some_and(|s| !s.env_keys.is_empty())
+                && !f.reason.contains("time ran out before the next key")
+        })
+        .filter_map(|f| {
+            let name = display_name(&f.provider);
+            let spent = f.code == "credits_exhausted" || f.reason.contains("(out of credit)");
+            let rejected = f.category == FailureCategory::Auth && f.http_status == Some(401);
+            match (spent, rejected) {
+                (true, true) => Some(format!("every {name} key was rejected or is out of credit")),
+                (true, false) if f.code == "credits_exhausted" => {
+                    Some(format!("every {name} key is out of credit"))
+                }
+                (false, true) => Some(format!("every {name} key was rejected")),
+                _ => None,
+            }
+        })
+        .collect();
+    let list = match parts.as_slice() {
+        [] => return None,
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    };
+    Some(format!(
+        "Search needs the owner: {list}. Top up or replace those keys."
+    ))
+}
+
+/// A provider's name as a person writes it.
+fn display_name(provider: &str) -> String {
+    let mut c = provider.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
 }
 
 /// Exit code for total failure, derived from the underlying causes:
@@ -633,5 +721,77 @@ mod tests {
             .exit_code(),
             3
         );
+    }
+
+    fn failure(
+        provider: &str,
+        category: FailureCategory,
+        code: &str,
+        reason: &str,
+    ) -> ProviderFailure {
+        ProviderFailure {
+            provider: provider.into(),
+            category,
+            http_status: None,
+            code: code.into(),
+            reason: reason.into(),
+            retryable: false,
+        }
+    }
+
+    /// Only causes the owner must fix get a sentence for the owner.
+    #[test]
+    fn the_owner_is_told_only_what_needs_the_owner() {
+        use FailureCategory::*;
+        let rejected = |p: &str, reason: &str| ProviderFailure {
+            http_status: Some(401),
+            ..failure(p, Auth, "auth_failed", reason)
+        };
+        let failed = vec![
+            failure("exa", BillingQuota, "credits_exhausted", "r"),
+            rejected(
+                "parallel",
+                "all 2 parallel keys failed: key 1 (out of credit): …",
+            ),
+            failure("keenable", Timeout, "timeout", "r"),
+        ];
+        assert_eq!(
+            owner_note(&failed).unwrap(),
+            "Search needs the owner: every Exa key is out of credit, and every Parallel key was rejected or is out of credit. Top up or replace those keys."
+        );
+        // Not the owner's: a timeout, an ambiguous quota answer, a 403, a
+        // keyless engine, or keys the time ran out before trying.
+        for f in [
+            failure("exa", Timeout, "timeout", "r"),
+            failure(
+                "parallel",
+                BillingQuota,
+                "insufficient_credits",
+                "quota exceeded",
+            ),
+            ProviderFailure {
+                http_status: Some(403),
+                ..failure("exa", Auth, "auth_failed", "r")
+            },
+            rejected("hackernews", "r"),
+            rejected(
+                "exa",
+                "key 1 of 2: …; the search's time ran out before the next key",
+            ),
+        ] {
+            assert!(owner_note(std::slice::from_ref(&f)).is_none(), "{f:?}");
+        }
+        let e = SearchError::AllProvidersFailed {
+            failed,
+            cost: None,
+            out_of_credit_keys: Vec::new(),
+        };
+        let r = e.to_error_response();
+        assert_eq!(
+            r.error.message,
+            "No search engine could answer: exa (out of credit), parallel (key rejected), keenable (timed out)."
+        );
+        assert!(r.error.for_owner.is_some());
+        assert!(r.error.suggestion.is_none());
     }
 }

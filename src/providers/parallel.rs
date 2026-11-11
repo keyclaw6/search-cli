@@ -1,6 +1,7 @@
-//! Parallel Search v1: `POST /v1/search`. `mode: "fast"` ($1 per 1,000) for
-//! general and news, `"advanced"` ($5 per 1,000) for deep, plus $1 per 1,000
-//! results above ten. v1 rejects unknown fields (`additionalProperties:
+//! Parallel Search v1: `POST /v1/search`. `mode: "advanced"` ($5 per 1,000)
+//! for general and deep, `"fast"` ($1 per 1,000) for news, plus $1 per 1,000
+//! results above ten. Advanced takes about 1.5–3 s a call, well inside the
+//! mode deadlines (25 s general, 50 s deep). v1 rejects unknown fields (`additionalProperties:
 //! false`), so the body carries only documented ones; `v1beta` is legacy.
 //! https://docs.parallel.ai/api-reference/search/search
 
@@ -32,21 +33,22 @@ pub static SPEC: ProviderSpec = ProviderSpec {
         lang: false,
     },
     max_count: 20,
-    // Advanced (deep) searches take longer than fast ones; the mode deadline
-    // still bounds general and news.
+    // Advanced searches take longer than fast ones; the mode deadline still
+    // bounds every call.
     timeout: Duration::from_secs(30),
     billed_on_send: true,
-    price: FAST,
+    price: ADVANCED,
 };
 
-/// `mode: "fast"`: general and news.
+/// `mode: "fast"`: news.
 const FAST: Price = Price {
     per_call: 1_000,
     per_extra_result: 1_000,
     included_results: 10,
 };
 
-/// `mode: "advanced"`: deep.
+/// `mode: "advanced"`: general and deep (the owner's choice: it found more
+/// original sources than fast in the round-8 test).
 const ADVANCED: Price = Price {
     per_call: 5_000,
     per_extra_result: 1_000,
@@ -54,10 +56,10 @@ const ADVANCED: Price = Price {
 };
 
 fn price(mode: Mode) -> Price {
-    if mode == Mode::Deep {
-        ADVANCED
-    } else {
+    if mode == Mode::News {
         FAST
+    } else {
+        ADVANCED
     }
 }
 
@@ -99,7 +101,7 @@ fn body(call: &Call<'_>) -> Value {
     json!({
         "objective": call.query,
         "search_queries": [keyword_query(call.query)],
-        "mode": if call.mode == Mode::Deep { "advanced" } else { "fast" },
+        "mode": if call.mode == Mode::News { "fast" } else { "advanced" },
         "advanced_settings": advanced,
     })
 }
@@ -139,6 +141,8 @@ fn keyword_query(query: &str) -> String {
 struct ParallelResponse {
     #[serde(default)]
     results: Vec<ParallelResult>,
+    #[serde(default)]
+    warnings: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +192,7 @@ fn parse(data: ParallelResponse, call: &Call<'_>) -> Output {
         results,
         answers: Vec::new(),
         cost_micros,
+        notes: super::note_messages(&data.warnings),
     }
 }
 
@@ -273,7 +278,8 @@ mod tests {
             top,
             ["advanced_settings", "mode", "objective", "search_queries"]
         );
-        assert_eq!(b["mode"], "fast");
+        assert_eq!(b["mode"], "advanced");
+        assert_eq!(body(&call(Mode::News, 10, &opts))["mode"], "fast");
         assert_eq!(b["search_queries"], json!(["rust async runtime"]));
         let a = &b["advanced_settings"];
         let mut keys: Vec<&str> = a.as_object().unwrap().keys().map(|k| k.as_str()).collect();
@@ -313,6 +319,35 @@ mod tests {
         assert_eq!(sp["include_domains"], json!(["docs.rs"]));
         assert!(sp.get("exclude_domains").is_none());
         assert!(b["advanced_settings"].get("location").is_none());
+    }
+
+    /// Parallel's warnings are kept for the search log, never as results.
+    #[test]
+    fn warnings_become_notes() {
+        let opts = SearchOpts::default();
+        let data: ParallelResponse = serde_json::from_str(
+            r#"{"results":[],"warnings":[{"type":"input_validation_warning","message":"1 of 1 search_queries were truncated to the maximum allowed length of 200 characters.","detail":null}]}"#,
+        )
+        .unwrap();
+        let out = parse(data, &call(Mode::General, 10, &opts));
+        assert_eq!(
+            out.notes,
+            ["1 of 1 search_queries were truncated to the maximum allowed length of 200 characters."]
+        );
+        assert!(parse(fixture(), &call(Mode::General, 10, &opts))
+            .notes
+            .is_empty());
+        // An odd warnings value never fails the results.
+        for odd in [
+            r#"null"#,
+            r#""plain text""#,
+            r#"{"x":1}"#,
+            r#"[1, {"message": 2}]"#,
+        ] {
+            let data: ParallelResponse =
+                serde_json::from_str(&format!(r#"{{"results":[],"warnings":{odd}}}"#)).unwrap();
+            let _ = parse(data, &call(Mode::General, 10, &opts));
+        }
     }
 
     /// A query over 200 characters goes whole into `objective`, and its
@@ -383,7 +418,7 @@ mod tests {
         let p = Parallel::new(Arc::new(AppContext::new(AppConfig::default())));
         assert_eq!(
             parse(fixture(), &call(Mode::General, 10, &opts)).cost_micros,
-            Some(1_000)
+            Some(5_000)
         );
         assert_eq!(
             parse(fixture(), &call(Mode::News, 20, &opts)).cost_micros,
@@ -397,7 +432,8 @@ mod tests {
             parse(fixture(), &call(Mode::Deep, 15, &opts)).cost_micros,
             Some(10_000)
         );
-        assert_eq!(p.sent_cost(Mode::General), 1_000);
+        assert_eq!(p.sent_cost(Mode::General), 5_000);
+        assert_eq!(p.sent_cost(Mode::News), 1_000);
         assert_eq!(p.sent_cost(Mode::Deep), 5_000);
     }
 }

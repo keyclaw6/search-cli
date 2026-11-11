@@ -96,6 +96,8 @@ struct KeyUse {
     refused: Vec<(usize, ProviderFailure)>,
     /// The place of a key that answered while marked out of credit.
     answered_marked: Option<usize>,
+    /// The first answer had no results, so the call was sent once more.
+    asked_again: bool,
 }
 
 impl KeyUse {
@@ -129,20 +131,29 @@ impl KeyUse {
             "key {} of {}{label}: {}; refused before it: {earlier}",
             self.last, self.of, last.reason
         );
-        // Marked keys go last, so the last answer is often "out of credit"
-        // again; the failure a user can act on is a key's other refusal.
-        if last.code == "credits_exhausted" {
-            if let Some((_, other)) = self
-                .refused
-                .iter()
-                .rev()
-                .find(|(_, f)| f.code != "credits_exhausted")
-            {
-                last.category = other.category;
-                last.code = other.code.clone();
-                last.http_status = other.http_status;
-                last.retryable = other.retryable;
+        // The cause that leads is the one a user can act on: anything that
+        // is not the key's own fault (a rate limit, a timeout, …) first, then
+        // a rejected key (401), then "out of credit", which marked keys going
+        // last often repeat. So the owner is told only when every key's cause
+        // is the owner's (`errors::owner_note`).
+        let rank = |f: &ProviderFailure| {
+            if f.code == "credits_exhausted" {
+                2
+            } else if f.category == FailureCategory::Auth && f.http_status == Some(401) {
+                1
+            } else {
+                0
             }
+        };
+        let lead = std::iter::once(&last)
+            .chain(self.refused.iter().rev().map(|(_, f)| f))
+            .min_by_key(|f| rank(f))
+            .map(|f| (f.category, f.code.clone(), f.http_status, f.retryable));
+        if let Some((category, code, http_status, retryable)) = lead {
+            last.category = category;
+            last.code = code;
+            last.http_status = http_status;
+            last.retryable = retryable;
         }
         last.reason = if self.tried == self.of {
             format!("all {} {provider} keys failed: {earlier}; {tail}", self.of)
@@ -267,7 +278,13 @@ pub(crate) async fn execute_with(
     let mut by_provider: BTreeMap<String, u64> = BTreeMap::new();
     let mut queried: Vec<String> = Vec::new();
     let mut key_slots: BTreeMap<String, usize> = BTreeMap::new();
+    // For maintainers (the search log), never printed: what providers said
+    // beside their results, and what the tool did about it.
+    let mut diagnostics: Vec<String> = Vec::new();
     for (name, outcome, keys) in outcomes {
+        if keys.asked_again {
+            diagnostics.push(format!("{name}: answered with no results; asked once more"));
+        }
         if let Some(place) = keys.answered_marked {
             warnings.push(format!(
                 "{name}: key {place} of {} answered again after being out of credit; its mark is cleared",
@@ -306,11 +323,13 @@ pub(crate) async fn execute_with(
         match outcome {
             Outcome::Done(out) => {
                 by_provider.insert(name.to_string(), answered_cost(&out));
+                diagnostics.extend(out.notes.iter().map(|n| format!("{name}: {n}")));
                 answers.extend(out.answers);
                 buckets.push((name.to_string(), out.results));
             }
             Outcome::Rejected(f, out) => {
                 tracing::warn!("{name}: {}", redact_secrets(&f.reason));
+                diagnostics.extend(out.notes.iter().map(|n| format!("{name}: {n}")));
                 by_provider.insert(name.to_string(), answered_cost(&out));
                 failures.push(f);
             }
@@ -448,6 +467,8 @@ pub(crate) async fn execute_with(
             cost,
             routing: None,
             notes: Vec::new(),
+            diagnostics,
+            for_owner: None,
         },
         results,
         answers,
@@ -520,6 +541,20 @@ fn time_left(deadline: Instant, adapter: &dyn Adapter) -> Duration {
 /// One provider's call. With several own keys, a key refused for its own
 /// reasons ([`providers::next_key_may_help`]) hands the call to the next key
 /// while the deadline allows; any other failure ends it.
+/// How long before the mode deadline a second ask must end, so the engine
+/// still keeps the first answer when the second call hangs.
+const SECOND_ASK_MARGIN: Duration = Duration::from_millis(250);
+
+/// Modes where an empty answer from an engine is unusual, so it is asked
+/// once more before it counts as no results.
+const ASK_AGAIN_MODES: &[Mode] = &[
+    Mode::General,
+    Mode::News,
+    Mode::Academic,
+    Mode::Deep,
+    Mode::Scholar,
+];
+
 /// A call's keys in the order to try them, and where it notes what it
 /// learns about marked keys.
 struct Keys<'a> {
@@ -564,7 +599,64 @@ async fn run_one(
             timeout: time_left(deadline, adapter),
             key: &slot.key,
         };
-        let failure = match tokio::time::timeout_at(deadline.into(), adapter.call(&call)).await {
+        let sent = Instant::now();
+        let mut answer = tokio::time::timeout_at(deadline.into(), adapter.call(&call)).await;
+        // In the web modes an answer with nothing in it is asked once more,
+        // with the same key, before it counts as no results (a service
+        // sometimes answers empty with an OK status). Only when there is time
+        // for a call as slow as the first; a failed second ask keeps the
+        // first answer. Elsewhere (places, social, …) empty is a normal answer.
+        if let Ok(Ok(first)) = &mut answer {
+            let took = sent.elapsed();
+            let free = first.cost_micros == Some(0);
+            if first.results.is_empty()
+                && first.answers.is_empty()
+                && !free
+                && ASK_AGAIN_MODES.contains(&mode)
+                && deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(SECOND_ASK_MARGIN)
+                    >= took
+            {
+                used.asked_again = true;
+                let paid = first
+                    .cost_micros
+                    .unwrap_or_else(|| adapter.spec().price.estimate(0));
+                // Ends before the mode deadline, so the first answer can still
+                // be kept when the second call is slow.
+                let cutoff = deadline - SECOND_ASK_MARGIN;
+                let again = Call {
+                    timeout: time_left(cutoff, adapter),
+                    ..call
+                };
+                match tokio::time::timeout_at(cutoff.into(), adapter.call(&again)).await {
+                    Ok(Ok(mut second)) => {
+                        let n = second.results.len() as u16;
+                        let cost = second
+                            .cost_micros
+                            .unwrap_or_else(|| adapter.spec().price.estimate(n));
+                        second.cost_micros = Some(paid + cost);
+                        *first = second;
+                    }
+                    // The first, empty answer stands. A second call that
+                    // timed out or answered unreadably was billed anyway.
+                    failed => {
+                        let billed = match &failed {
+                            Err(_) => true,
+                            Ok(Err(e)) => providers::billed_failure(e.category()),
+                            Ok(Ok(_)) => false,
+                        };
+                        let extra = if billed && adapter.spec().billed_on_send {
+                            adapter.sent_cost(mode)
+                        } else {
+                            0
+                        };
+                        first.cost_micros = Some(paid + extra);
+                    }
+                }
+            }
+        }
+        let failure = match answer {
             Ok(Ok(out)) => {
                 if slot.marked {
                     note(false, slot);
@@ -1048,6 +1140,7 @@ mod tests {
                             .into_iter()
                             .collect(),
                         cost_micros: *cost,
+                        notes: Vec::new(),
                     })
                 }
                 Act::Fail(category) => Err(SearchError::Upstream {
@@ -1650,6 +1743,186 @@ mod tests {
         assert_eq!(tried(&log), [K1, K2]);
         assert_eq!(resp.metadata.key_slots.get("exa"), Some(&2));
         assert_eq!(resp.results.len(), 1);
+    }
+
+    /// Answers empty on its first call, then with one result (or empty
+    /// again, or a server error).
+    struct EmptyFirst {
+        calls: Arc<Mutex<u32>>,
+        always_empty: bool,
+        fail_second: bool,
+        /// The second call never answers.
+        hang_second: bool,
+        spec: &'static ProviderSpec,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for EmptyFirst {
+        fn spec(&self) -> &'static ProviderSpec {
+            self.spec
+        }
+        fn is_configured(&self) -> bool {
+            true
+        }
+        async fn call(&self, _call: &Call<'_>) -> Result<Output, SearchError> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if n == 2 && self.hang_second {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            if n == 2 && self.fail_second {
+                return Err(SearchError::Upstream {
+                    provider: "parallel",
+                    status: 500,
+                    category: FailureCategory::Server,
+                    message: "boom".into(),
+                });
+            }
+            let results = if n == 1 || self.always_empty {
+                Vec::new()
+            } else {
+                vec![result("https://p.example/1", "parallel")]
+            };
+            Ok(Output {
+                results,
+                cost_micros: Some(5_000),
+                ..Output::default()
+            })
+        }
+    }
+
+    /// A failed second ask keeps the first, empty answer (no results, not
+    /// a failure); outside the web modes an empty answer is not asked again.
+    #[tokio::test]
+    async fn a_failed_second_ask_keeps_the_empty_answer() {
+        let calls = Arc::new(Mutex::new(0));
+        let adapter = Box::new(EmptyFirst {
+            calls: calls.clone(),
+            always_empty: false,
+            fail_second: true,
+            hang_second: false,
+            spec: &parallel::SPEC,
+        }) as Box<dyn Adapter>;
+        let resp = search(vec![adapter], Mode::General, 10, None, 5_000)
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(resp.status, "no_results");
+        assert!(resp.metadata.providers_failed.is_empty());
+        // A refused second call (here a 500) is not billed; the first is.
+        assert_eq!(resp.metadata.cost.unwrap().by_provider["parallel"], 5_000);
+
+        let calls = Arc::new(Mutex::new(0));
+        let adapter = Box::new(EmptyFirst {
+            calls: calls.clone(),
+            always_empty: true,
+            fail_second: false,
+            hang_second: false,
+            spec: &serper::SPEC,
+        }) as Box<dyn Adapter>;
+        let _ = search(vec![adapter], Mode::Places, 10, None, 5_000).await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "places: empty is a normal answer"
+        );
+    }
+
+    /// A second ask that hangs ends before the mode deadline, so the first,
+    /// empty answer still stands (no results, not a timeout), with both
+    /// calls counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hanging_second_ask_keeps_the_empty_answer() {
+        for _ in 0..5 {
+            let calls = Arc::new(Mutex::new(0));
+            let adapter = Box::new(EmptyFirst {
+                calls: calls.clone(),
+                always_empty: false,
+                fail_second: false,
+                hang_second: true,
+                spec: &parallel::SPEC,
+            }) as Box<dyn Adapter>;
+            let (others, _) = fakes(&[(&exa::SPEC, ok(0, 2, "e"))]);
+            let mut plan = vec![adapter];
+            plan.extend(others);
+            let resp = search(plan, Mode::General, 10, None, 1_000).await.unwrap();
+            assert_eq!(*calls.lock().unwrap(), 2);
+            assert_eq!(
+                resp.status, "success",
+                "{:?}",
+                resp.metadata.providers_failed
+            );
+            assert!(resp.metadata.providers_timed_out.is_empty());
+            assert_eq!(resp.metadata.cost.unwrap().by_provider["parallel"], 10_000);
+        }
+    }
+
+    /// The owner is told only when every key's cause is the owner's: a
+    /// rate-limited key beside a rejected one leads with the rate limit.
+    #[test]
+    fn a_key_refused_for_another_cause_keeps_the_owner_out_of_it() {
+        let f = |category: FailureCategory, status: u16, code: &str| ProviderFailure {
+            provider: "exa".into(),
+            category,
+            http_status: Some(status),
+            code: code.into(),
+            reason: "r".into(),
+            retryable: false,
+        };
+        let rejected = || f(FailureCategory::Auth, 401, "auth_failed");
+        let limited = || f(FailureCategory::RateLimit, 429, "rate_limited");
+        let spent = || f(FailureCategory::BillingQuota, 402, "credits_exhausted");
+        let used = |refused: Vec<ProviderFailure>| KeyUse {
+            of: 2,
+            tried: 2,
+            last: 2,
+            refused: refused.into_iter().map(|f| (1, f)).collect(),
+            ..KeyUse::default()
+        };
+        for (first, last) in [(limited(), rejected()), (rejected(), limited())] {
+            let out = used(vec![first]).failure("exa", last);
+            assert_eq!(out.category, FailureCategory::RateLimit);
+            assert!(crate::errors::owner_note(&[out]).is_none());
+        }
+        let out = used(vec![spent()]).failure("exa", rejected());
+        assert_eq!(out.http_status, Some(401));
+        assert!(crate::errors::owner_note(&[out])
+            .unwrap()
+            .contains("every Exa key was rejected or is out of credit"));
+        let out = used(vec![spent()]).failure("exa", spent());
+        assert!(crate::errors::owner_note(&[out])
+            .unwrap()
+            .contains("every Exa key is out of credit"));
+    }
+
+    /// An empty answer is asked once more before it counts as no results,
+    /// and both calls are counted in the cost.
+    #[tokio::test]
+    async fn an_empty_answer_is_asked_once_more() {
+        for always_empty in [false, true] {
+            let calls = Arc::new(Mutex::new(0));
+            let adapter = Box::new(EmptyFirst {
+                calls: calls.clone(),
+                always_empty,
+                fail_second: false,
+                hang_second: false,
+                spec: &parallel::SPEC,
+            }) as Box<dyn Adapter>;
+            let resp = search(vec![adapter], Mode::General, 10, None, 5_000)
+                .await
+                .unwrap();
+            assert_eq!(*calls.lock().unwrap(), 2, "asked twice, never more");
+            assert_eq!(resp.results.len(), usize::from(!always_empty));
+            assert_eq!(resp.metadata.cost.unwrap().by_provider["parallel"], 10_000);
+            assert!(resp
+                .metadata
+                .diagnostics
+                .iter()
+                .any(|d| d == "parallel: answered with no results; asked once more"));
+        }
     }
 
     /// One slow platform does not hold up the social fan-out: once the wait

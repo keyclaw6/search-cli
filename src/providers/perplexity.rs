@@ -160,6 +160,7 @@ fn parse(data: PerplexityResponse, call: &Call<'_>) -> Output {
         results,
         answers: Vec::new(),
         cost_micros: Some(SPEC.price.estimate(0)),
+        notes: Vec::new(),
     }
 }
 

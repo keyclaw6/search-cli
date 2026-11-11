@@ -274,6 +274,7 @@ fn parse(mode: Mode, body: &Value) -> Output {
         results,
         answers,
         cost_micros,
+        notes: Vec::new(),
     }
 }
 

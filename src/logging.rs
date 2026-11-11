@@ -73,7 +73,13 @@ pub fn log_search(response: &SearchResponse) {
             .map(|f| format!("{}:{}", f.provider, f.category.as_str()))
             .collect::<Vec<_>>(),
         "answers": response.answers.iter().map(|a| &a.provider).collect::<Vec<_>>(),
-        "warnings": response.metadata.warnings.len(),
+        // For maintainers: providers' own notes and what the tool did.
+        "diagnostics": response
+            .metadata
+            .diagnostics
+            .iter()
+            .map(|d| crate::errors::redact_secrets(d))
+            .collect::<Vec<_>>(),
         "sources": response.results.iter().map(|r| &r.source).collect::<Vec<_>>(),
         "urls": response.results.iter().take(10).map(|r| &r.url).collect::<Vec<_>>(),
     });

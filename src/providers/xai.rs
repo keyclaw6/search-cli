@@ -111,6 +111,7 @@ fn deep_skip(call: &Call<'_>) -> Option<Output> {
         results: Vec::new(),
         answers: Vec::new(),
         cost_micros: Some(0),
+        notes: Vec::new(),
     })
 }
 
@@ -422,6 +423,7 @@ fn parse(data: XaiResponse, call: &Call<'_>) -> Result<Output, SearchError> {
         results,
         answers,
         cost_micros: cost,
+        notes: Vec::new(),
     })
 }
 

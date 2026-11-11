@@ -179,6 +179,7 @@ impl Adapter for Brave {
                     results,
                     answers: Vec::new(),
                     cost_micros: Some(per_call * billed),
+                    notes: Vec::new(),
                 })
             }
             _ => {

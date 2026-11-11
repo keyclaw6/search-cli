@@ -322,6 +322,22 @@ pub fn http_error_message(status: u16, body: &str) -> String {
     }
 }
 
+/// The messages in a provider's warnings or notices: a string, or a list of
+/// strings or of objects with a `message`. Read leniently, as a raw value, so
+/// a field kept only for the search log can never fail the results.
+pub fn note_messages(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::String(s) if !s.is_empty() => vec![s.clone()],
+        serde_json::Value::Array(items) => items.iter().flat_map(note_messages).collect(),
+        serde_json::Value::Object(o) => o
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(|m| vec![m.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Options for calls that apply no filters (vertical endpoints).
 pub static NO_FILTERS: crate::types::SearchOpts = crate::types::SearchOpts {
     include_domains: Vec::new(),

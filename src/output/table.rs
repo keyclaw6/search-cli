@@ -5,6 +5,14 @@ use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, ContentArra
 pub fn render(response: &SearchResponse) {
     let use_color = crate::output::use_color();
 
+    if let Some(note) = &response.metadata.for_owner {
+        if use_color {
+            eprintln!("  {} {}", "!".yellow().bold(), note.yellow());
+        } else {
+            eprintln!("  ! {note}");
+        }
+    }
+
     if response.results.is_empty() && response.answers.is_empty() {
         if use_color {
             eprintln!("{}", "No results found.".yellow());
