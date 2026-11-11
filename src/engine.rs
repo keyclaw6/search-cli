@@ -98,6 +98,10 @@ struct KeyUse {
     answered_marked: Option<usize>,
     /// The first answer had no results, so the call was sent once more.
     asked_again: bool,
+    /// What the calls cost when the engine did not answer, if known exactly
+    /// (one call per query, some sent and some not); otherwise the engine's
+    /// `sent_cost` applies.
+    billed: Option<u64>,
 }
 
 impl KeyUse {
@@ -358,16 +362,23 @@ pub(crate) async fn execute_with(
             }
             Outcome::Failed(f) => {
                 tracing::warn!("{name}: {}", redact_secrets(&f.reason));
-                if providers::billed_failure(f.category) {
-                    if let Some(c) = sent_cost {
+                match keys.billed {
+                    Some(c) if c > 0 => {
                         by_provider.insert(name.to_string(), c);
                     }
+                    Some(_) => {}
+                    None if providers::billed_failure(f.category) => {
+                        if let Some(c) = sent_cost {
+                            by_provider.insert(name.to_string(), c);
+                        }
+                    }
+                    None => {}
                 }
                 failures.push(f);
             }
             Outcome::TimedOut => {
                 tracing::warn!("{name}: still running when the search stopped waiting");
-                if let Some(c) = sent_cost {
+                if let Some(c) = keys.billed.or(sent_cost).filter(|c| *c > 0) {
                     by_provider.insert(name.to_string(), c);
                 }
                 timed_out.push(name.to_string());
@@ -710,13 +721,29 @@ async fn run_each(
         // Nothing answered. The cause that leads is the one the owner cannot
         // act on, as with one query's keys (`KeyUse::failure`): a timeout or
         // any other failure before a rejected key, before "out of credit".
-        // Nothing sent at all counts as a timeout too.
+        // The engine is charged what its queries really cost, and its
+        // failure names every query's.
+        used.billed = Some(cost);
         let outcome = match failures.into_iter().min_by_key(lead_rank) {
-            Some(f) if !timed_out || lead_rank(&f) == 0 => Outcome::Failed(f),
-            _ => Outcome::TimedOut,
+            Some(mut f) if !timed_out || lead_rank(&f) == 0 => {
+                f.reason = out.notes.join("; ");
+                Outcome::Failed(f)
+            }
+            Some(_) => Outcome::TimedOut,
+            None if timed_out => Outcome::TimedOut,
+            // Not one query was sent: no cost, and not a timeout either.
+            None => Outcome::Failed(ProviderFailure {
+                provider: name.to_string(),
+                category: FailureCategory::Other,
+                http_status: None,
+                code: "not_sent".to_string(),
+                reason: "not sent: the search's time was up".to_string(),
+                retryable: true,
+            }),
         };
         return (outcome, used);
     }
+    // With answers from different keys, the highest place among them.
     if let Some(slot) = answered_with {
         used.last = slot;
     }
@@ -2473,6 +2500,80 @@ mod tests {
         );
         let same = lead_first(rows(&["https://a.example/"]), Some("z.example".into()));
         assert_eq!(same[0].url, "https://a.example/");
+    }
+
+    /// Every query failing: the engine is charged what was really sent, and
+    /// its failure names each query's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn when_every_query_fails_the_cost_is_what_was_sent() {
+        let exa_with = |failing: Vec<&'static str>, hanging: Vec<&'static str>| {
+            Box::new(QueryLog {
+                spec: &exa::SPEC,
+                several: false,
+                seen: Arc::new(Mutex::new(Vec::new())),
+                failing,
+                hanging,
+                delay: Duration::ZERO,
+                keys: Vec::new(),
+            }) as Box<dyn Adapter>
+        };
+        let one_call = exa_with(vec![], vec![]).sent_cost(Mode::General);
+        assert!(one_call > 0);
+        let failed = |e: SearchError| match e {
+            SearchError::AllProvidersFailed { failed, cost, .. } => (
+                failed,
+                cost.map(|c| c.by_provider.get("exa").copied().unwrap_or(0)),
+            ),
+            other => panic!("{other:?}"),
+        };
+
+        // One query hangs (sent, so billed), one is rate limited (not billed).
+        let err = search_queries_within(
+            vec![exa_with(vec!["kw two"], vec!["kw one"])],
+            &["kw one", "kw two"],
+            None,
+            10,
+            1_000,
+        )
+        .await
+        .unwrap_err();
+        let (f, cost) = failed(err);
+        assert_eq!(f[0].category, FailureCategory::RateLimit);
+        assert!(f[0].reason.contains("query 1 (kw one)"), "{}", f[0].reason);
+        assert!(
+            f[0].reason.contains("query 2 (kw two) failed"),
+            "{}",
+            f[0].reason
+        );
+        assert_eq!(cost, Some(one_call));
+
+        // Both hang: a timeout, charged two calls.
+        let err = search_queries_within(
+            vec![exa_with(vec![], vec!["kw one", "kw two"])],
+            &["kw one", "kw two"],
+            None,
+            10,
+            1_000,
+        )
+        .await
+        .unwrap_err();
+        let (f, cost) = failed(err);
+        assert_eq!(f[0].category, FailureCategory::Timeout);
+        assert_eq!(cost, Some(2 * one_call));
+
+        // No time to send anything: not a timeout, and free.
+        let err = search_queries_within(
+            vec![exa_with(vec![], vec![])],
+            &["kw one", "kw two", "kw three"],
+            None,
+            10,
+            200,
+        )
+        .await
+        .unwrap_err();
+        let (f, cost) = failed(err);
+        assert_eq!(f[0].code, "not_sent");
+        assert_eq!(cost.unwrap_or(0), 0);
     }
 
     /// One query without --goal is the search it always was.
