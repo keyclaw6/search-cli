@@ -306,13 +306,43 @@ fn mark_page_chars(response: &mut types::SearchResponse) {
     }
 }
 
-/// `--from N`: each page's text from character N on.
-fn apply_from(response: &mut types::SearchResponse, from: Option<usize>) {
-    let Some(from) = from else { return };
+/// How much of a page one read shows: the window round 17 tested, which
+/// fits a long PDF in a few reads.
+const READ_WINDOW: usize = 30_000;
+
+/// A page read (extract, without --goal) shows [`READ_WINDOW`] characters
+/// from `--from` (default 0); when the page goes on, the text ends with the
+/// command that reads the next part and `extra.next_from` gives its offset.
+fn apply_window(response: &mut types::SearchResponse, from: Option<usize>) {
+    if !matches!(response.mode.as_str(), "extract" | "scrape") {
+        return;
+    }
+    let start = from.unwrap_or(0);
+    // The URL as asked, so the next read finds the page this one kept.
+    let asked = response.query.clone();
     for r in &mut response.results {
-        r.snippet = r.snippet.chars().skip(from).collect();
+        let n = r.snippet.chars().count();
+        let end = n.min(start.saturating_add(READ_WINDOW));
+        if start == 0 && end == n {
+            continue;
+        }
+        let mut part: String = r
+            .snippet
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect();
+        if end < n {
+            part.push_str(&format!(
+                "\n\n[the page continues: search search -q \"{asked}\" --from {end}]"
+            ));
+        }
+        r.snippet = part;
         if let Some(obj) = r.extra.as_mut().and_then(|e| e.as_object_mut()) {
-            obj.insert("from".to_string(), from.into());
+            obj.insert("from".to_string(), start.into());
+            if end < n {
+                obj.insert("next_from".to_string(), end.into());
+            }
         }
     }
 }
@@ -385,7 +415,8 @@ async fn focus_page(
         }
     }
     if let Some(page) = response.results.first_mut() {
-        page.snippet = focus::render(&page.snippet, &page.url, goal, excerpts.as_deref());
+        // The URL as asked, so a --from read finds the page this one kept.
+        page.snippet = focus::render(&page.snippet, &response.query, goal, excerpts.as_deref());
         if let Some(obj) = page.extra.as_mut().and_then(|e| e.as_object_mut()) {
             obj.remove("excerpts");
             obj.insert(
@@ -801,7 +832,9 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 {
                     mark_replay(&mut cached, Some(age));
                     logging::log_search(&cached);
-                    apply_from(&mut cached, args.from);
+                    if args.goal.is_none() {
+                        apply_window(&mut cached, args.from);
+                    }
                     apply_max_chars(&mut cached, args.max_chars);
                     if ctx.is_json() {
                         output::json::render(&cached);
@@ -996,7 +1029,9 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 }
             }
             logging::log_search(&response);
-            apply_from(&mut response, args.from);
+            if opts.goal.is_none() {
+                apply_window(&mut response, args.from);
+            }
             apply_max_chars(&mut response, args.max_chars);
 
             if ctx.is_json() {

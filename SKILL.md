@@ -29,9 +29,10 @@ Parallel gets the question and every query in one call and leads the results;
 Keenable (and Exa) search the question itself and add a few short pages that
 Parallel did not find.
 
-To read a page: `search search -q "<url>"` gives it whole (`results[0].snippet`);
-add `--goal "<what you need>"` for its outline with character offsets and the
-passages for that need; `--from <offset>` reads on from any offset.
+To read a page: `search search -q "<url>"` gives its text (`results[0].snippet`,
+30,000 characters a read; a longer page ends with the command for the next
+part); add `--goal "<what you need>"` for its outline with character offsets
+and the passages for that need; `--from <offset>` reads on from any offset.
 
 ## Choosing a mode
 

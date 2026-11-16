@@ -1051,3 +1051,53 @@ fn from_and_goal_fit_only_where_they_mean_something() {
         assert_eq!(out.status.code(), Some(3), "{args:?}");
     }
 }
+
+/// A long page is read 30,000 characters at a time: the text ends with the
+/// command for the next part, and that read comes from the page kept.
+#[test]
+fn a_long_page_is_read_in_windows() {
+    let para =
+        "<p>Every paragraph of this long report says the same thing again.</p>\n".repeat(600);
+    let body = format!(
+        "<!doctype html><html><head><title>Report</title></head><body><article><h1>Report</h1>{para}<p>The last line.</p></article></body></html>"
+    );
+    let url = serve_html(body, 1);
+    let run = |args: &[&str]| {
+        let out = offline_cmd("window").args(args).output().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let v = run(&["search", "-q", &url, "--allow-private", "--json"]);
+    let r = &v["results"][0];
+    let total = r["extra"]["page_chars"].as_u64().unwrap();
+    assert!(total > 30_000, "{total}");
+    assert_eq!(r["extra"]["next_from"], 30_000);
+    let text = r["snippet"].as_str().unwrap();
+    assert!(
+        text.ends_with(&format!(
+            "[the page continues: search search -q \"{url}\" --from 30000]"
+        )),
+        "{}",
+        &text[text.len() - 200..]
+    );
+    let v = run(&[
+        "search",
+        "-q",
+        &url,
+        "--from",
+        "30000",
+        "--allow-private",
+        "--json",
+    ]);
+    let r = &v["results"][0];
+    assert_eq!(v["metadata"]["cached"], true);
+    assert!(r["extra"].get("next_from").is_none());
+    assert!(r["snippet"]
+        .as_str()
+        .unwrap()
+        .trim_end()
+        .ends_with("The last line."));
+    assert_eq!(
+        r["snippet"].as_str().unwrap().chars().count() as u64,
+        total - 30_000
+    );
+}

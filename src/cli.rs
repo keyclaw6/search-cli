@@ -222,8 +222,8 @@ pub struct SearchArgs {
     #[arg(long)]
     pub goal: Option<String>,
 
-    /// Extract: the page's text from this character on (an offset from a
-    /// focused read's outline or passages)
+    /// Extract: the page's text from this character on, 30,000 characters a
+    /// read (an offset from a focused read, or the next part of a long page)
     #[arg(long, value_name = "OFFSET")]
     pub from: Option<usize>,
 
