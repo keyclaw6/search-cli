@@ -938,3 +938,116 @@ fn several_queries_search_the_web_modes_only() {
         assert_eq!(out.status.code(), Some(3), "{mode}");
     }
 }
+
+/// Serve one HTML page on 127.0.0.1 for `requests` connections.
+fn serve_html(body: String, requests: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(requests) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body.as_bytes());
+        }
+    });
+    format!("http://{addr}/requirements")
+}
+
+/// A URL with --goal is a focused read: the outline with offsets, then the
+/// passages for the need (chosen here without keys). --from reads the page
+/// on from an offset the outline gave, from the page the focused read kept.
+#[test]
+fn a_goal_reads_a_page_focused_and_from_reads_on() {
+    let filler =
+        "<p>Cookie notice, navigation and other text that says nothing about the need.</p>\n"
+            .repeat(150);
+    let body = format!(
+        "<!doctype html><html><head><title>Market requirements</title></head><body><article><h1>Market requirements</h1>{filler}<h2>DK1 FCR</h2><p>The delivery duration for FCR in DK1 is 30 minutes, and the minimum bid is 1 MW.</p>{filler}</article></body></html>"
+    );
+    let url = serve_html(body, 1);
+    let run = |args: &[&str]| {
+        let out = offline_cmd("focus").args(args).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), v)
+    };
+    let (code, v) = run(&[
+        "search",
+        "-q",
+        &url,
+        "--goal",
+        "FCR delivery duration in DK1",
+        "--allow-private",
+        "--json",
+    ]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["mode"], "extract");
+    let r = &v["results"][0];
+    let view = r["snippet"].as_str().unwrap();
+    assert!(
+        view.contains("focused view for: FCR delivery duration in DK1"),
+        "{view}"
+    );
+    assert!(view.contains("30 minutes"), "{view}");
+    assert!(view.chars().count() < 10_000, "{}", view.len());
+    assert_eq!(r["extra"]["focus"], "local");
+    let page_chars = r["extra"]["page_chars"].as_u64().unwrap();
+    assert!(page_chars > 8_000);
+    let offset: u64 = view
+        .lines()
+        .find(|l| l.trim_end().ends_with("DK1 FCR") && l.contains(':'))
+        .and_then(|l| l.trim().split(':').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no DK1 FCR in the outline: {view}"));
+
+    // The server answered once: this read comes from the page kept.
+    let (code, v) = run(&[
+        "search",
+        "-q",
+        &url,
+        "--from",
+        &offset.to_string(),
+        "--max-chars",
+        "80",
+        "--allow-private",
+        "--json",
+    ]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["metadata"]["cached"], true);
+    let part = v["results"][0]["snippet"].as_str().unwrap();
+    assert!(part.starts_with("## DK1 FCR"), "{part}");
+    assert_eq!(v["results"][0]["extra"]["from"], offset);
+    assert_eq!(v["results"][0]["extra"]["page_chars"], page_chars);
+}
+
+/// --from reads a page; several -q never go with a URL to read.
+#[test]
+fn from_and_goal_fit_only_where_they_mean_something() {
+    for args in [
+        vec![
+            "search", "-m", "news", "-q", "rust", "--from", "10", "--json",
+        ],
+        vec![
+            "search",
+            "-m",
+            "extract",
+            "-q",
+            "https://example.com/a",
+            "-q",
+            "kw",
+            "--json",
+        ],
+        vec![
+            "search", "-m", "places", "-q", "cafes", "--goal", "coffee", "--json",
+        ],
+    ] {
+        let out = offline_cmd("fromgoal").args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+    }
+}

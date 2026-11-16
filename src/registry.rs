@@ -75,13 +75,16 @@ const fn secs(s: u64) -> Duration {
 
 /// The extract chain, free and honest first, paid renderers last: the
 /// direct markdown-first GET, the local browser-fingerprint fetch (only when
-/// direct was refused, see [`rung_gate`]), Jina Reader (renders JS, reads
-/// PDFs), Firecrawl (PDFs capped at 20 pages), Browserless (anti-bot last
-/// resort).
+/// direct was refused, see [`rung_gate`]), Parallel's extract and Keenable's
+/// fetch (both read pages that need a browser, and PDFs; our search keys),
+/// Jina Reader (renders JS, reads PDFs), Firecrawl (PDFs capped at 20
+/// pages), Browserless (anti-bot last resort).
 const EXTRACT_CHAIN: &[&str] = &[
     "direct",
     #[cfg(feature = "stealth")]
     "stealth",
+    "parallel",
+    "keenable",
     "jina",
     "firecrawl",
     "browserless",
@@ -173,8 +176,8 @@ pub const MODES: &[ModeSpec] = &[
         input: InputKind::Url,
         merge: MergeKind::Chain,
         providers: EXTRACT_CHAIN,
-        description: "Full page as markdown: a direct fetch (markdown first), a browser-fingerprint fetch when refused, then Jina Reader, Firecrawl, Browserless. Reddit, HN and social post URLs go to their source first",
-        when_to_use: "One page, JS-heavy or anti-bot pages included; -q is a URL.",
+        description: "Full page as markdown: a direct fetch (markdown first), a browser-fingerprint fetch when refused, then Parallel's extract, Keenable's fetch, Jina Reader, Firecrawl, Browserless. Reddit, HN and social post URLs go to their source first",
+        when_to_use: "One page, JS-heavy pages and PDFs included; -q is a URL. --goal gives a focused read (outline with offsets and the passages for that need); --from N reads on from character N.",
         deadline: secs(65),
         straggler_cap: None,
     },
@@ -604,6 +607,10 @@ mod tests {
         assert_eq!(chain.last(), Some(&"browserless"));
         #[cfg(feature = "stealth")]
         assert_eq!(pos("stealth"), 1);
+        // Our search keys read what the local fetch cannot, before the
+        // renderers we hold no key for.
+        assert!(pos("direct") < pos("parallel") && pos("parallel") < pos("keenable"));
+        assert!(pos("keenable") < pos("jina"));
     }
 
     #[test]
@@ -615,7 +622,14 @@ mod tests {
                 price: Some("USD 0.01".into()),
             }),
         );
-        for rung in ["stealth", "jina", "firecrawl", "browserless"] {
+        for rung in [
+            "stealth",
+            "parallel",
+            "keenable",
+            "jina",
+            "firecrawl",
+            "browserless",
+        ] {
             let err = rung_gate(rung, url).unwrap_err();
             assert_eq!(err.category(), FailureCategory::Rejected);
             assert!(err.to_string().contains("USD 0.01"), "{err}");
@@ -645,6 +659,7 @@ mod tests {
             assert_eq!(rung_gate("stealth", &url).is_ok(), runs, "{saw:?}");
             // A JS shell or a PDF goes on to the rendering rungs.
             assert!(rung_gate("jina", &url).is_ok(), "{saw:?}");
+            assert!(rung_gate("parallel", &url).is_ok(), "{saw:?}");
         }
     }
 

@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
     long_about = "Eleven search engines across 14 modes; TikTok, Instagram, YouTube,\n\
         Facebook, Threads and X (social mode); Reddit and Hacker News\n\
         (community mode, no key); and page extraction (local fetchers first,\n\
-        then Jina Reader, Firecrawl or Browserless).\n\
+        then Parallel, Keenable, Jina Reader, Firecrawl or Browserless).\n\
         With no -m the mode is auto: a URL extracts (a TikTok, YouTube or\n\
         Reddit link reads the post whole: transcript, comments), \"on tiktok\"\n\
         or \"twitter\" searches that platform, \"reddit\" or \"what do people\n\
@@ -214,10 +214,18 @@ pub struct SearchArgs {
     pub queries: Vec<String>,
 
     /// The question the -q keyword queries serve, in plain words. Parallel
-    /// searches with it and every query in one call; the other engines run
-    /// each -q
+    /// searches with it and every query in one call and leads the results;
+    /// Keenable and Exa search with it alone and add a few pages Parallel did
+    /// not find; other engines run each -q. With a URL (extract): what you
+    /// need from the page, for a focused read (the page's outline with
+    /// character offsets, then the passages for that need)
     #[arg(long)]
     pub goal: Option<String>,
+
+    /// Extract: the page's text from this character on (an offset from a
+    /// focused read's outline or passages)
+    #[arg(long, value_name = "OFFSET")]
+    pub from: Option<usize>,
 
     /// The first -q (set from `queries`).
     #[arg(skip)]
@@ -237,6 +245,7 @@ pub struct SearchArgs {
     pub no_rerank: bool,
 
     /// Number of results to return, for the whole search however many -q
+    /// (with --goal: Parallel's results, before the few the others add)
     #[arg(short, long)]
     pub count: Option<usize>,
 

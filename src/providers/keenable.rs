@@ -4,12 +4,17 @@
 //! this adapter serves. One credit per search, whatever the result count:
 //! 100,000 free a month on an account, then $4 per 1,000.
 //! https://docs.keenable.ai/products/search.md
+//!
+//! Fetch: `GET /v1/fetch`, the page's main text as markdown (PDFs too), a
+//! rung of the extract chain after Parallel's. A page it has no copy of is
+//! fetched live, which can take most of a minute; the extract deadline
+//! allows it. https://docs.keenable.ai/api-reference/fetch.md
 
 use super::spec::{FilterSupport, Price};
 use super::{Adapter, Call, Output, ProviderSpec};
 use crate::context::AppContext;
 use crate::errors::SearchError;
-use crate::types::{Mode, SearchResult};
+use crate::types::{FailureCategory, Mode, SearchResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,12 +22,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.keenable.ai/v1/search";
+const FETCH_ENDPOINT: &str = "https://api.keenable.ai/v1/fetch";
+/// Fetch cuts a page at 50,000 characters unless asked for more; a whole
+/// page is wanted (the local fetch also caps a page at 5 MB).
+const FETCH_CHARS: u32 = 5_000_000;
 const SNIPPET_CHARS: u32 = 1_500;
 
 pub static SPEC: ProviderSpec = ProviderSpec {
     name: "keenable",
     env_keys: &["KEENABLE_API_KEY"],
-    modes: &[Mode::General, Mode::Deep],
+    modes: &[Mode::General, Mode::Deep, Mode::Extract],
     filters: FilterSupport {
         freshness: true,
         // `site` takes one site only; the include/exclude lists are applied
@@ -32,7 +41,9 @@ pub static SPEC: ProviderSpec = ProviderSpec {
         lang: false,
     },
     max_count: 50,
-    timeout: Duration::from_secs(30),
+    // A live fetch took 13–52 s (16 November 2026); searches are bounded by
+    // their 25 s mode deadline anyway.
+    timeout: Duration::from_secs(60),
     billed_on_send: true,
     price: PRO,
 };
@@ -125,6 +136,43 @@ fn parse(data: KeenableResponse, call: &Call<'_>) -> Output {
     }
 }
 
+#[derive(Deserialize)]
+struct FetchResponse {
+    url: Option<String>,
+    title: Option<String>,
+    #[serde(default)]
+    content: String,
+    published_at: Option<String>,
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    credits: Option<f64>,
+}
+
+/// One credit is $0.004 at the paid rate; a fetch costs what `usage` says.
+fn fetch_output(data: FetchResponse, url: &str) -> Output {
+    let credits = data.usage.and_then(|u| u.credits).unwrap_or(1.0);
+    Output {
+        results: vec![SearchResult {
+            title: data.title.unwrap_or_default(),
+            url: data
+                .url
+                .filter(|u| u.starts_with("http"))
+                .unwrap_or_else(|| url.to_string()),
+            snippet: data.content,
+            source: "keenable".to_string(),
+            published: data.published_at.filter(|d| !d.is_empty()),
+            image_url: None,
+            extra: Some(json!({ "content_type": "text/markdown" })),
+        }],
+        answers: Vec::new(),
+        cost_micros: Some((credits * PRO.per_call as f64).round() as u64),
+        notes: Vec::new(),
+    }
+}
+
 #[async_trait]
 impl Adapter for Keenable {
     fn spec(&self) -> &'static ProviderSpec {
@@ -155,15 +203,55 @@ impl Adapter for Keenable {
         PRO.estimate(0)
     }
 
+    /// Given the whole question it found 197 of 236 facts against 171 for
+    /// the keyword queries, in one call instead of about three (round 16).
+    fn takes_question(&self) -> bool {
+        true
+    }
+
+    /// Fetch's answers about the page, not the key: the site refused it
+    /// (403 `Upstream forbidden`), there is no page (404) or no text could be
+    /// taken from it (422).
+    fn classify(&self, status: u16, body: &str) -> Option<FailureCategory> {
+        let upstream = || {
+            serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v["error"]
+                        .as_str()
+                        .map(|e| e.eq_ignore_ascii_case("upstream forbidden"))
+                })
+                .unwrap_or(false)
+        };
+        match status {
+            404 => Some(FailureCategory::BadRequest),
+            422 => Some(FailureCategory::Rejected),
+            403 if upstream() => Some(FailureCategory::Rejected),
+            _ => None,
+        }
+    }
+
     async fn call(&self, call: &Call<'_>) -> Result<Output, SearchError> {
         if !self.is_configured() {
             return Err(SearchError::AuthMissing {
                 provider: "keenable",
             });
         }
-        let body = body(call);
         let client = &self.ctx.client;
         let api_key = call.key;
+        if matches!(call.mode, Mode::Extract | Mode::Scrape) {
+            crate::registry::rung_gate("keenable", call.query)?;
+            let max = FETCH_CHARS.to_string();
+            let resp = super::send(self, call.timeout, || {
+                client
+                    .get(FETCH_ENDPOINT)
+                    .header("X-API-Key", api_key)
+                    .query(&[("url", call.query), ("max_chars", max.as_str())])
+            })
+            .await?;
+            return Ok(fetch_output(resp.json().await?, call.query));
+        }
+        let body = body(call);
         let resp = super::send(self, call.timeout, || {
             client
                 .post(ENDPOINT)
@@ -245,5 +333,39 @@ mod tests {
             out.results[0].published.as_deref(),
             Some("2026-10-30T00:00:00Z")
         );
+    }
+
+    /// A fetch is the page; its cost is what `usage` says.
+    #[test]
+    fn a_fetch_is_the_page_at_its_credits() {
+        let data: FetchResponse = serde_json::from_value(json!({
+            "url": "https://www.energinet.dk/a.pdf", "title": "Udbud", "content": "Text",
+            "truncated": false, "total_chars": 4, "published_at": "2026-11-04T13:52:27Z",
+            "usage": {"sku": "fetch.live", "amount": 1, "credits": 2, "paid": false}
+        }))
+        .unwrap();
+        let out = fetch_output(data, "http://www.energinet.dk/a.pdf");
+        assert_eq!(out.results[0].url, "https://www.energinet.dk/a.pdf");
+        assert_eq!(out.results[0].snippet, "Text");
+        assert_eq!(out.cost_micros, Some(8_000));
+    }
+
+    /// Fetch's answers about the page are not the key's fault.
+    #[test]
+    fn page_answers_are_not_key_failures() {
+        let k = Keenable::new(Arc::new(AppContext::new(
+            crate::config::AppConfig::default(),
+        )));
+        assert_eq!(
+            k.classify(
+                403,
+                r#"{"error":"Upstream forbidden","message":"The site blocked the fetch."}"#
+            ),
+            Some(FailureCategory::Rejected)
+        );
+        assert_eq!(k.classify(403, r#"{"error":"Forbidden"}"#), None);
+        assert_eq!(k.classify(422, "{}"), Some(FailureCategory::Rejected));
+        assert_eq!(k.classify(404, "{}"), Some(FailureCategory::BadRequest));
+        assert!(k.takes_question());
     }
 }

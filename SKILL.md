@@ -25,8 +25,13 @@ exit code.
 
 For a question, give the question and a few short keyword queries in one
 search: `search search -m general -c 10 --goal "<the question>" -q "<kw 1>" -q "<kw 2>"`.
-Parallel gets the question and every query in one call; the other engines run
-each query; all results come back fused as one list of `-c` results.
+Parallel gets the question and every query in one call and leads the results;
+Keenable (and Exa) search the question itself and add a few short pages that
+Parallel did not find.
+
+To read a page: `search search -q "<url>"` gives it whole (`results[0].snippet`);
+add `--goal "<what you need>"` for its outline with character offsets and the
+passages for that need; `--from <offset>` reads on from any offset.
 
 ## Choosing a mode
 

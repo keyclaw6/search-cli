@@ -306,7 +306,7 @@ fn first_phrase(lower: &str, phrases: &[&str]) -> Option<String> {
 }
 
 /// Rule 1: the whole trimmed query is one absolute http(s) URL.
-fn is_absolute_url(q: &str) -> bool {
+pub fn is_absolute_url(q: &str) -> bool {
     let l = q.to_ascii_lowercase();
     (l.starts_with("http://") || l.starts_with("https://"))
         && !q.chars().any(char::is_whitespace)

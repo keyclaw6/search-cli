@@ -243,10 +243,11 @@ pub(crate) async fn execute_with(
         }
     }
     // Several keyword queries: an engine that takes them all in one call
-    // gets them so; every other engine runs one call per distinct query.
+    // gets them so, an engine that reads a whole question gets the goal, and
+    // every other engine runs one call per distinct query.
     let queries = distinct_queries(req).len();
     // With a goal, the engine that read the goal and every query in one
-    // call puts its first result first (`lead_first`).
+    // call leads the results (`lead_merge`).
     let leader: Option<&'static str> = req
         .opts
         .goal
@@ -272,7 +273,7 @@ pub(crate) async fn execute_with(
         .iter()
         .filter(|a| a.spec().billed_on_send)
         .map(|a| {
-            let calls = if a.takes_several_queries() {
+            let calls = if one_call(a.as_ref(), req.opts) {
                 1
             } else {
                 queries
@@ -433,14 +434,21 @@ pub(crate) async fn execute_with(
     // Only fused modes merge across providers. Chain and single keep the
     // answering provider's rows and order as sent: rows may share a URL
     // (images from one page) or have none (places).
+    let led = mode_spec.merge == MergeKind::Fused
+        && leader.is_some_and(|l| {
+            buckets
+                .iter()
+                .any(|(name, items)| name == l && !items.is_empty())
+        });
     let mut results = match mode_spec.merge {
-        MergeKind::Fused => {
-            let first = leader
-                .and_then(|l| buckets.iter().find(|(name, _)| name == l))
-                .and_then(|(_, items)| items.first())
-                .map(|r| normalize_url(&r.url));
-            lead_first(fuse_rrf(buckets), first)
+        MergeKind::Fused if led => {
+            let (lead, others): (Vec<_>, Vec<_>) = buckets
+                .into_iter()
+                .partition(|(name, _)| Some(name.as_str()) == leader);
+            let lead = lead.into_iter().flat_map(|(_, items)| items).collect();
+            lead_merge(lead, others, req.count)
         }
+        MergeKind::Fused => fuse_rrf(buckets),
         MergeKind::Chain | MergeKind::Single => {
             buckets.into_iter().flat_map(|(_, items)| items).collect()
         }
@@ -460,8 +468,11 @@ pub(crate) async fn execute_with(
         });
     }
 
-    // -c is the number of results shown, however many queries the search has.
-    results.truncate(req.count);
+    // -c is the number of results shown, however many queries the search
+    // has; a led search counts the leader's (its few additions come after).
+    if !led {
+        results.truncate(req.count);
+    }
 
     if mode == Mode::Extract {
         // Scraped page content is untrusted input for the consuming agent —
@@ -593,6 +604,12 @@ const SECOND_ASK_MARGIN: Duration = Duration::from_millis(250);
 /// requests a second per organization).
 const QUERY_CONCURRENCY: usize = 4;
 
+/// Whether an engine answers a search in one call: it takes every keyword
+/// query at once, or it reads a whole question and the search has a goal.
+fn one_call(adapter: &dyn Adapter, opts: &SearchOpts) -> bool {
+    adapter.takes_several_queries() || (opts.goal.is_some() && adapter.takes_question())
+}
+
 /// A search's distinct keyword queries, in the order given.
 fn distinct_queries(req: &Request<'_>) -> Vec<String> {
     let mut distinct: Vec<String> = vec![req.query.to_string()];
@@ -605,8 +622,9 @@ fn distinct_queries(req: &Request<'_>) -> Vec<String> {
 }
 
 /// One engine's part of a search. An engine that takes several keyword
-/// queries gets them all in one call; any other engine runs each query as
-/// its own call ([`run_each`]).
+/// queries gets them all in one call; one that reads a whole question gets
+/// the goal, when there is one, as its query; any other engine runs each
+/// query as its own call ([`run_each`]).
 async fn run_engine(
     adapter: &dyn Adapter,
     keys: Keys<'_>,
@@ -616,7 +634,9 @@ async fn run_engine(
     opts: &SearchOpts,
     deadline: Instant,
 ) -> (Outcome, KeyUse) {
-    if queries.len() > 1 && !adapter.takes_several_queries() {
+    if let Some(goal) = opts.goal.as_deref().filter(|_| adapter.takes_question()) {
+        run_one(adapter, keys, mode, goal, count, opts, deadline).await
+    } else if queries.len() > 1 && !adapter.takes_several_queries() {
         run_each(adapter, keys, mode, queries, count, opts, deadline).await
     } else {
         run_one(adapter, keys, mode, &queries[0], count, opts, deadline).await
@@ -1096,20 +1116,60 @@ fn no_providers_error(mode: Mode, only: Option<&[String]>) -> SearchError {
     }
 }
 
-/// Moves the fused row of the leading engine's first result (by its URL
-/// key) to the top; the rest keep their fused order. With a goal, the
-/// engine that read the goal and every query in one call (Parallel) put the
-/// original source first more often than the fusion did (round 10: 74% of
-/// searches against 50%), while the other engines' lists still add what it
-/// lacks below it. Without its answer (it failed), the fusion stands.
-fn lead_first(mut fused: Vec<SearchResult>, first: Option<String>) -> Vec<SearchResult> {
-    let Some(key) = first.filter(|k| !k.is_empty()) else {
-        return fused;
-    };
-    if let Some(at) = fused.iter().position(|r| normalize_url(&r.url) == key) {
-        fused[..=at].rotate_right(1);
+/// How many pages the other engines add to a led search, and how much of
+/// each one's text is shown: about 3,000 characters in all, as tested.
+const ADDITIONS: usize = 5;
+const ADDITION_CHARS: usize = 600;
+
+/// A search with a goal, led by the engine that read the goal and every
+/// query in one call (Parallel): its first `count` results in its own order
+/// with its own text, then at most [`ADDITIONS`] pages the other engines
+/// found and it did not (fused, so a page they agree on comes first), each
+/// cut to [`ADDITION_CHARS`]. No page twice. In round 16 Parallel alone held
+/// 226 of 236 facts and all three engines 231, while the full fusion, which
+/// showed another engine's shorter text for a shared page, scored below
+/// Parallel alone. Without the leader's answer the fusion stands.
+fn lead_merge(
+    lead: Vec<SearchResult>,
+    others: Vec<(String, Vec<SearchResult>)>,
+    count: usize,
+) -> Vec<SearchResult> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<SearchResult> = lead
+        .into_iter()
+        .filter(|r| {
+            let key = normalize_url(&r.url);
+            key.is_empty() || seen.insert(key)
+        })
+        .take(count)
+        .collect();
+    let added = fuse_rrf(others)
+        .into_iter()
+        .filter(|r| {
+            let key = normalize_url(&r.url);
+            !key.is_empty() && seen.insert(key)
+        })
+        .take(ADDITIONS)
+        .map(|mut r| {
+            r.snippet = clip_words(&r.snippet, ADDITION_CHARS);
+            r
+        });
+    out.extend(added);
+    out
+}
+
+/// `text` cut to at most `max` characters at a word, with an ellipsis.
+fn clip_words(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
     }
-    fused
+    let cut: String = text.chars().take(max - 1).collect();
+    let kept = match cut.rfind(char::is_whitespace) {
+        Some(i) if i > cut.len() / 2 => &cut[..i],
+        _ => &cut[..],
+    };
+    format!("{}…", kept.trim_end())
 }
 
 /// Reciprocal rank fusion across provider buckets. Each URL scores
@@ -1292,7 +1352,7 @@ fn is_tracker(param: &str) -> bool {
 mod tests {
     use super::*;
     use crate::providers::{brave, exa, firecrawl, jina, linkup, parallel, perplexity, serpapi};
-    use crate::providers::{serper, tavily, xai, ProviderSpec};
+    use crate::providers::{keenable, serper, tavily, xai, ProviderSpec};
     use std::sync::Mutex;
 
     fn result(url: &str, source: &str) -> SearchResult {
@@ -2164,6 +2224,8 @@ mod tests {
     struct QueryLog {
         spec: &'static ProviderSpec,
         several: bool,
+        /// Reads a whole question (gets the goal as its one query).
+        question: bool,
         seen: Seen,
         /// Queries that fail (rate limited).
         failing: Vec<&'static str>,
@@ -2185,6 +2247,9 @@ mod tests {
         }
         fn takes_several_queries(&self) -> bool {
             self.several
+        }
+        fn takes_question(&self) -> bool {
+            self.question
         }
         fn keys(&self) -> Vec<String> {
             self.keys.iter().map(|k| k.to_string()).collect()
@@ -2233,6 +2298,7 @@ mod tests {
         let a = QueryLog {
             spec,
             several,
+            question: false,
             seen: seen.clone(),
             failing: failing.to_vec(),
             hanging: Vec::new(),
@@ -2284,6 +2350,7 @@ mod tests {
         let exa = Box::new(QueryLog {
             spec: &exa::SPEC,
             several: false,
+            question: false,
             seen: seen.clone(),
             failing: Vec::new(),
             hanging: vec!["kw four"],
@@ -2307,6 +2374,7 @@ mod tests {
         let exa = Box::new(QueryLog {
             spec: &exa::SPEC,
             several: false,
+            question: false,
             seen: Arc::new(Mutex::new(Vec::new())),
             failing: Vec::new(),
             hanging: vec!["b1"],
@@ -2324,6 +2392,7 @@ mod tests {
         let exa = Box::new(QueryLog {
             spec: &exa::SPEC,
             several: false,
+            question: false,
             seen: Arc::new(Mutex::new(Vec::new())),
             failing: Vec::new(),
             hanging: Vec::new(),
@@ -2386,8 +2455,9 @@ mod tests {
             .collect();
         exa_queries.sort();
         assert_eq!(exa_queries, ["kw one", "kw three", "kw two"], "each once");
-        // -c is the number shown, however many queries.
-        assert_eq!(resp.results.len(), 2);
+        // -c is the number Parallel shows, however many queries; with a
+        // goal the other engines add a few pages after it.
+        assert_eq!(resp.results.len(), 2 + ADDITIONS);
         assert_eq!(resp.metadata.provider_results["exa"], 9);
         let cost = resp.metadata.cost.unwrap().by_provider;
         assert_eq!((cost["exa"], cost["parallel"]), (3_000, 1_000));
@@ -2428,6 +2498,7 @@ mod tests {
         let exa = Box::new(QueryLog {
             spec: &exa::SPEC,
             several: false,
+            question: false,
             seen: seen.clone(),
             failing: vec!["kw two"],
             hanging: Vec::new(),
@@ -2448,58 +2519,125 @@ mod tests {
         assert_eq!(cost["exa"], 3_000, "the refusal is not billed");
     }
 
-    /// With a goal, Parallel's first result leads; the rest is the fusion.
+    /// With a goal, Parallel leads: its results in its own order, then at
+    /// most a few short pages the others found and it did not, never a page
+    /// twice. An engine that reads a question gets the goal as its one query.
     /// Without a goal, or when Parallel fails, the fusion stands.
     #[tokio::test]
-    async fn with_a_goal_parallels_first_result_leads() {
+    async fn with_a_goal_parallel_leads_and_the_others_add_a_few_pages() {
         let queries = ["kw one", "kw two"];
-        let top = |resp: &SearchResponse| resp.results[0].url.clone();
+        let urls = |resp: &SearchResponse| -> Vec<String> {
+            resp.results.iter().map(|r| r.url.clone()).collect()
+        };
+        let keenable = || {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let a = QueryLog {
+                spec: &keenable::SPEC,
+                several: false,
+                question: true,
+                seen: seen.clone(),
+                failing: Vec::new(),
+                hanging: Vec::new(),
+                delay: Duration::ZERO,
+                keys: Vec::new(),
+            };
+            (Box::new(a) as Box<dyn Adapter>, seen)
+        };
         let (par, _) = query_log(&parallel::SPEC, true, &[]);
-        let (exa, _) = query_log(&exa::SPEC, false, &[]);
-        let resp = search_queries(vec![exa, par], &queries, Some("the question"), 10)
+        let (kee, kee_seen) = keenable();
+        let resp = search_queries(vec![kee, par], &queries, Some("the question"), 2)
             .await
             .unwrap();
-        assert_eq!(top(&resp), "https://parallel.example/kwone/0");
-        assert_eq!(resp.results[1].url, "https://exa.example/kwone/0");
-        assert_eq!(resp.results.len(), 9);
+        assert_eq!(
+            *kee_seen.lock().unwrap(),
+            [(
+                "the question".to_string(),
+                Some("the question".to_string()),
+                1
+            )],
+            "one call with the question"
+        );
+        assert_eq!(
+            urls(&resp),
+            [
+                "https://parallel.example/kwone/0",
+                "https://parallel.example/kwone/1",
+                "https://keenable.example/thequestion/0",
+                "https://keenable.example/thequestion/1",
+                "https://keenable.example/thequestion/2",
+            ],
+            "-c counts Parallel's results; the additions come after"
+        );
+        assert_eq!(resp.metadata.cost.unwrap().by_provider["keenable"], 1_000);
 
+        // Without a goal: the fusion, and Keenable runs each query.
         let (par, _) = query_log(&parallel::SPEC, true, &[]);
-        let (exa, _) = query_log(&exa::SPEC, false, &[]);
-        let resp = search_queries(vec![exa, par], &queries, None, 10)
+        let (kee, kee_seen) = keenable();
+        let resp = search_queries(vec![kee, par], &queries, None, 10)
             .await
             .unwrap();
-        assert_eq!(top(&resp), "https://exa.example/kwone/0", "no goal: fusion");
+        assert_eq!(kee_seen.lock().unwrap().len(), 2);
+        assert_eq!(resp.results.len(), 9, "the fusion of every list");
 
+        // Parallel failed: the others' fusion.
         let (par, _) = query_log(&parallel::SPEC, true, &["kw one"]);
-        let (exa, _) = query_log(&exa::SPEC, false, &[]);
-        let resp = search_queries(vec![exa, par], &queries, Some("the question"), 10)
+        let (kee, _) = keenable();
+        let resp = search_queries(vec![kee, par], &queries, Some("the question"), 10)
             .await
             .unwrap();
-        assert_eq!(top(&resp), "https://exa.example/kwone/0", "Parallel failed");
+        assert_eq!(resp.results.len(), 3);
+        assert_eq!(
+            resp.results[0].url,
+            "https://keenable.example/thequestion/0"
+        );
     }
 
     #[test]
-    fn the_leading_row_moves_up_and_keeps_its_votes() {
-        let rows = |urls: &[&str]| urls.iter().map(|u| result(u, "exa")).collect::<Vec<_>>();
-        let fused = lead_first(
-            rows(&[
-                "https://a.example/",
-                "https://b.example/",
-                "https://c.example/",
-            ]),
-            Some(normalize_url("http://www.c.example")),
-        );
-        let urls: Vec<&str> = fused.iter().map(|r| r.url.as_str()).collect();
+    fn the_additions_are_new_pages_cut_short() {
+        let row = |u: &str, src: &str, text: &str| SearchResult {
+            snippet: text.to_string(),
+            ..result(u, src)
+        };
+        let long = "word ".repeat(400);
+        let lead = vec![
+            row("https://a.example/", "parallel", "A"),
+            row("https://a.example/#again", "parallel", "A again"),
+            row("https://b.example/", "parallel", "B"),
+        ];
+        let others = vec![
+            (
+                "keenable".to_string(),
+                (0..8)
+                    .map(|i| row(&format!("https://k.example/{i}"), "keenable", &long))
+                    .chain([row("http://www.b.example", "keenable", "short B")])
+                    .collect(),
+            ),
+            (
+                "exa".to_string(),
+                vec![
+                    row("https://k.example/7", "exa", "seven"),
+                    row("https://e.example/", "exa", "E"),
+                ],
+            ),
+        ];
+        let out = lead_merge(lead, others, 10);
+        let urls: Vec<&str> = out.iter().map(|r| r.url.as_str()).collect();
         assert_eq!(
-            urls,
-            [
-                "https://c.example/",
-                "https://a.example/",
-                "https://b.example/"
-            ]
+            urls[..2],
+            ["https://a.example/", "https://b.example/"],
+            "Parallel's own order, no page twice"
         );
-        let same = lead_first(rows(&["https://a.example/"]), Some("z.example".into()));
-        assert_eq!(same[0].url, "https://a.example/");
+        assert_eq!(out[1].snippet, "B", "Parallel's text kept for its page");
+        assert_eq!(out.len(), 2 + ADDITIONS);
+        assert_eq!(
+            out[2].url, "https://k.example/7",
+            "a page both found leads the additions"
+        );
+        assert!(out[3..]
+            .iter()
+            .all(|r| r.snippet.chars().count() <= ADDITION_CHARS));
+        assert!(out[3].snippet.ends_with("word…"), "{}", out[3].snippet);
+        assert!(!urls.contains(&"http://www.b.example"));
     }
 
     /// Every query failing: the engine is charged what was really sent, and
@@ -2510,6 +2648,7 @@ mod tests {
             Box::new(QueryLog {
                 spec: &exa::SPEC,
                 several: false,
+                question: false,
                 seen: Arc::new(Mutex::new(Vec::new())),
                 failing,
                 hanging,

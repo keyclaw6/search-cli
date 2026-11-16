@@ -4,13 +4,19 @@
 //! mode deadlines (25 s general, 50 s deep). v1 rejects unknown fields (`additionalProperties:
 //! false`), so the body carries only documented ones; `v1beta` is legacy.
 //! https://docs.parallel.ai/api-reference/search/search
+//!
+//! Extract v1: `POST /v1/extract` ($1 per 1,000 URLs), a rung of the extract
+//! chain after the local fetch: it reads pages that need a browser and PDFs.
+//! It always asks for the full content; with a goal it also asks for the
+//! passages that serve it (`objective`), which a focused read shows.
+//! https://docs.parallel.ai/api-reference/extract/extract
 
 use super::perplexity::host_in;
 use super::spec::{FilterSupport, Price};
 use super::{Adapter, Call, Output, ProviderSpec};
 use crate::context::AppContext;
 use crate::errors::SearchError;
-use crate::types::{Mode, SearchResult};
+use crate::types::{FailureCategory, Mode, SearchResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -18,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.parallel.ai/v1/search";
+const EXTRACT_ENDPOINT: &str = "https://api.parallel.ai/v1/extract";
 const EXCERPT_CHARS: u32 = 1_500;
 /// Parallel cuts each `search_queries` entry at this many characters.
 const QUERY_MAX: usize = 200;
@@ -25,7 +32,7 @@ const QUERY_MAX: usize = 200;
 pub static SPEC: ProviderSpec = ProviderSpec {
     name: "parallel",
     env_keys: &["PARALLEL_API_KEY"],
-    modes: &[Mode::General, Mode::News, Mode::Deep],
+    modes: &[Mode::General, Mode::News, Mode::Deep, Mode::Extract],
     filters: FilterSupport {
         freshness: true,
         domains: true,
@@ -55,11 +62,18 @@ const ADVANCED: Price = Price {
     included_results: 10,
 };
 
+/// Extract: one URL, excerpts and full content alike.
+const EXTRACT: Price = Price {
+    per_call: 1_000,
+    per_extra_result: 0,
+    included_results: 1,
+};
+
 fn price(mode: Mode) -> Price {
-    if mode == Mode::News {
-        FAST
-    } else {
-        ADVANCED
+    match mode {
+        Mode::News => FAST,
+        Mode::Extract | Mode::Scrape => EXTRACT,
+        _ => ADVANCED,
     }
 }
 
@@ -205,6 +219,103 @@ fn parse(data: ParallelResponse, call: &Call<'_>) -> Output {
     }
 }
 
+/// The extract request: the page's full content, and with a goal the
+/// passages that serve it, at most [`crate::focus::BUDGET`] characters.
+fn extract_body(call: &Call<'_>) -> Value {
+    let mut b = json!({
+        "urls": [call.query],
+        "advanced_settings": { "full_content": true },
+    });
+    if let Some(goal) = call.opts.goal.as_deref() {
+        b["objective"] = json!(goal);
+        b["max_chars_total"] = json!(crate::focus::BUDGET);
+    }
+    b
+}
+
+#[derive(Deserialize)]
+struct ExtractResponse {
+    #[serde(default)]
+    results: Vec<ExtractResult>,
+    #[serde(default)]
+    errors: Vec<ExtractError>,
+    #[serde(default)]
+    warnings: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct ExtractResult {
+    url: Option<String>,
+    title: Option<String>,
+    publish_date: Option<String>,
+    #[serde(default)]
+    excerpts: Vec<String>,
+    full_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExtractError {
+    #[serde(default)]
+    error_type: String,
+    http_status_code: Option<u16>,
+    content: Option<String>,
+}
+
+/// The page as one result: its full content as the snippet, and with a goal
+/// the chosen passages in `extra.excerpts`. A page Parallel could not read
+/// (a fetch error, or no content) is a failure, so the chain goes on.
+fn parse_extract(data: ExtractResponse, call: &Call<'_>) -> Result<Output, SearchError> {
+    let notes = super::note_messages(&data.warnings);
+    let page = data.results.into_iter().find(|r| {
+        r.full_content
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty())
+    });
+    let Some(r) = page else {
+        let (status, why) = match data.errors.first() {
+            Some(e) => (
+                e.http_status_code.unwrap_or(0),
+                format!(
+                    "{}{}",
+                    e.error_type,
+                    e.content
+                        .as_deref()
+                        .map(|c| format!(": {}", c.chars().take(200).collect::<String>()))
+                        .unwrap_or_default()
+                ),
+            ),
+            None => (200, "no content for this page".to_string()),
+        };
+        return Err(SearchError::Upstream {
+            provider: "parallel",
+            status,
+            category: FailureCategory::Rejected,
+            message: why,
+        });
+    };
+    let mut extra = json!({ "content_type": "text/markdown" });
+    if call.opts.goal.is_some() {
+        extra["excerpts"] = json!(r.excerpts);
+    }
+    Ok(Output {
+        results: vec![SearchResult {
+            title: r.title.unwrap_or_default(),
+            url: r
+                .url
+                .filter(|u| u.starts_with("http"))
+                .unwrap_or_else(|| call.query.to_string()),
+            snippet: r.full_content.unwrap_or_default(),
+            source: "parallel".to_string(),
+            published: r.publish_date.filter(|d| !d.is_empty()),
+            image_url: None,
+            extra: Some(extra),
+        }],
+        answers: Vec::new(),
+        cost_micros: Some(EXTRACT.estimate(1)),
+        notes,
+    })
+}
+
 #[async_trait]
 impl Adapter for Parallel {
     fn spec(&self) -> &'static ProviderSpec {
@@ -240,9 +351,21 @@ impl Adapter for Parallel {
                 provider: "parallel",
             });
         }
-        let body = body(call);
         let client = &self.ctx.client;
         let api_key = call.key;
+        if matches!(call.mode, Mode::Extract | Mode::Scrape) {
+            crate::registry::rung_gate("parallel", call.query)?;
+            let body = extract_body(call);
+            let resp = super::send(self, call.timeout, || {
+                client
+                    .post(EXTRACT_ENDPOINT)
+                    .header("x-api-key", api_key)
+                    .json(&body)
+            })
+            .await?;
+            return parse_extract(resp.json().await?, call);
+        }
+        let body = body(call);
         let resp = super::send(self, call.timeout, || {
             client
                 .post(ENDPOINT)
@@ -470,5 +593,65 @@ mod tests {
         assert_eq!(p.sent_cost(Mode::General), 5_000);
         assert_eq!(p.sent_cost(Mode::News), 1_000);
         assert_eq!(p.sent_cost(Mode::Deep), 5_000);
+    }
+
+    /// Extract asks for the full content always, and with a goal for the
+    /// passages that serve it; the full content is the page.
+    #[test]
+    fn extract_reads_the_whole_page_and_with_a_goal_its_passages() {
+        let url = "https://www.energinet.dk/media/x/udbud.pdf";
+        let plain = SearchOpts::default();
+        let mut c = call(Mode::Extract, 1, &plain);
+        c.query = url;
+        let b = extract_body(&c);
+        assert_eq!(b["urls"], json!([url]));
+        assert_eq!(b["advanced_settings"]["full_content"], true);
+        assert!(b.get("objective").is_none());
+        let focused = SearchOpts {
+            goal: Some("FCR delivery duration".into()),
+            ..SearchOpts::default()
+        };
+        let mut c = call(Mode::Extract, 1, &focused);
+        c.query = url;
+        let b = extract_body(&c);
+        assert_eq!(b["objective"], "FCR delivery duration");
+        assert_eq!(b["max_chars_total"], crate::focus::BUDGET);
+
+        let data: ExtractResponse = serde_json::from_value(json!({
+            "extract_id": "e", "session_id": "s", "errors": [],
+            "results": [{"url": url, "title": "Udbud", "publish_date": "2026-11-02",
+                         "excerpts": ["part one\n...\npart two"], "full_content": "# Udbud\n\nWhole text."}]
+        }))
+        .unwrap();
+        let out = parse_extract(data, &c).unwrap();
+        let r = &out.results[0];
+        assert_eq!(r.snippet, "# Udbud\n\nWhole text.");
+        assert_eq!(
+            r.extra.as_ref().unwrap()["excerpts"],
+            json!(["part one\n...\npart two"])
+        );
+        assert_eq!(out.cost_micros, Some(1_000));
+        let p = Parallel::new(Arc::new(AppContext::new(AppConfig::default())));
+        assert_eq!(p.sent_cost(Mode::Extract), 1_000);
+    }
+
+    /// A page Parallel could not read is a failure, so the chain goes on.
+    #[test]
+    fn an_unread_page_is_a_failure() {
+        let opts = SearchOpts::default();
+        let c = call(Mode::Extract, 1, &opts);
+        let data: ExtractResponse = serde_json::from_value(json!({
+            "results": [],
+            "errors": [{"url": "u", "error_type": "fetch_error", "http_status_code": 500, "content": "boom"}]
+        }))
+        .unwrap();
+        let err = parse_extract(data, &c).unwrap_err();
+        assert_eq!(err.category(), FailureCategory::Rejected);
+        assert!(err.to_string().contains("fetch_error: boom"), "{err}");
+        let empty: ExtractResponse = serde_json::from_value(
+            json!({"results": [{"url": "u", "excerpts": [], "full_content": " "}]}),
+        )
+        .unwrap();
+        assert!(parse_extract(empty, &c).is_err());
     }
 }

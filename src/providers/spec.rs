@@ -103,6 +103,11 @@ pub trait Adapter: Send + Sync {
     fn takes_several_queries(&self) -> bool {
         false
     }
+    /// Reads a whole question well: in a search with a goal it gets the goal
+    /// as its one query instead of one call per keyword query.
+    fn takes_question(&self) -> bool {
+        false
+    }
     /// What one call in `mode` costs once sent, before any answer: the price
     /// of a call that times out or whose 2xx fails to parse. Override when a
     /// mode sends more than the base call (Tavily's advanced depth, Brave

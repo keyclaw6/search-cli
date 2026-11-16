@@ -5,6 +5,7 @@ mod context;
 mod doctor;
 mod engine;
 mod errors;
+mod focus;
 mod guard;
 mod logging;
 mod output;
@@ -101,6 +102,7 @@ const SEARCH_FLAG_TOKENS: &[&str] = &[
     "-q",
     "--query",
     "--goal",
+    "--from",
     "-m",
     "--mode",
     "-p",
@@ -292,11 +294,119 @@ fn apply_max_chars(response: &mut types::SearchResponse, max_chars: Option<usize
     }
 }
 
+/// The page's length in characters, in `extra.page_chars` of every extract
+/// result, so a reader knows where `--from` can go.
+fn mark_page_chars(response: &mut types::SearchResponse) {
+    for r in &mut response.results {
+        let n = r.snippet.chars().count();
+        let extra = r.extra.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert("page_chars".to_string(), n.into());
+        }
+    }
+}
+
+/// `--from N`: each page's text from character N on.
+fn apply_from(response: &mut types::SearchResponse, from: Option<usize>) {
+    let Some(from) = from else { return };
+    for r in &mut response.results {
+        r.snippet = r.snippet.chars().skip(from).collect();
+        if let Some(obj) = r.extra.as_mut().and_then(|e| e.as_object_mut()) {
+            obj.insert("from".to_string(), from.into());
+        }
+    }
+}
+
+/// A focused read (`--goal` with a URL): the page's text becomes its outline
+/// and the passages for the need. The passages are Parallel's when its
+/// extract read the page with the goal, or when it can be asked now (the
+/// page came from another rung); otherwise they are chosen locally.
+async fn focus_page(
+    app: &Arc<AppContext>,
+    response: &mut types::SearchResponse,
+    mode: types::Mode,
+    opts: &types::SearchOpts,
+    pinned: bool,
+) {
+    let Some(goal) = opts.goal.as_deref() else {
+        return;
+    };
+    let Some(page) = response.results.first() else {
+        return;
+    };
+    let excerpts_of = |r: &types::SearchResult| -> Option<Vec<String>> {
+        let list: Vec<String> = r
+            .extra
+            .as_ref()?
+            .get("excerpts")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        Some(focus::split_excerpts(&list)).filter(|l| !l.is_empty())
+    };
+    let mut excerpts = excerpts_of(page);
+    let long = page.snippet.chars().count() > focus::BUDGET;
+    let asked = response
+        .metadata
+        .providers_queried
+        .iter()
+        .any(|p| p == "parallel");
+    let can_ask = !pinned
+        && providers::build_providers(app)
+            .iter()
+            .any(|p| p.name() == "parallel" && p.is_configured());
+    if excerpts.is_none() && long && !asked && can_ask {
+        let only = Some(vec!["parallel".to_string()]);
+        match engine::run(app.clone(), &response.query, mode, 1, &only, opts).await {
+            Ok(r) => {
+                if let Some(cost) = r.metadata.cost {
+                    let mut by = response
+                        .metadata
+                        .cost
+                        .take()
+                        .map(|c| c.by_provider)
+                        .unwrap_or_default();
+                    for (k, v) in cost.by_provider {
+                        *by.entry(k).or_default() += v;
+                    }
+                    response.metadata.cost = Some(types::CostSummary::with_basis(by, "estimate"));
+                }
+                response
+                    .metadata
+                    .providers_queried
+                    .push("parallel".to_string());
+                excerpts = r.results.first().and_then(excerpts_of);
+            }
+            Err(e) => response.metadata.diagnostics.push(format!(
+                "parallel (passages for the focused read): {}",
+                errors::redact_secrets(&e.to_string())
+            )),
+        }
+    }
+    if let Some(page) = response.results.first_mut() {
+        page.snippet = focus::render(&page.snippet, &page.url, goal, excerpts.as_deref());
+        if let Some(obj) = page.extra.as_mut().and_then(|e| e.as_object_mut()) {
+            obj.remove("excerpts");
+            obj.insert(
+                "focus".to_string(),
+                (if excerpts.is_some() {
+                    "parallel"
+                } else {
+                    "local"
+                })
+                .into(),
+            );
+        }
+    }
+}
+
 /// SearchArgs for the bare `search "query"` shorthand: auto mode, defaults.
 fn default_search_args(query: String) -> cli::SearchArgs {
     cli::SearchArgs {
         queries: vec![query.clone()],
         goal: None,
+        from: None,
         query,
         mode: cli::ModeArg::Auto,
         no_rerank: false,
@@ -438,9 +548,9 @@ fn agent_info(app: &Arc<AppContext>) -> serde_json::Value {
         "name": "search",
         "version": env!("CARGO_PKG_VERSION"),
         "description": env!("CARGO_PKG_DESCRIPTION"),
-        "usage": "search \"<query>\" | search search -q <query|url> [-q <query>]... [--goal <question>] [-m auto|<mode>] [-p a,b] [-c N] [-f day|week|month|year] [-d dom,..] [--exclude-domain dom,..] [--country cc] [--lang ll] [--no-cache] [--max-chars N] [--allow-private]",
+        "usage": "search \"<query>\" | search search -q <query|url> [-q <query>]... [--goal <question|need>] [--from N] [-m auto|<mode>] [-p a,b] [-c N] [-f day|week|month|year] [-d dom,..] [--exclude-domain dom,..] [--country cc] [--lang ll] [--no-cache] [--max-chars N] [--allow-private]",
         "commands": {
-            "search": "Search (default). -q is a URL in extract/scrape/similar",
+            "search": "Search (default). -q is a URL in extract/scrape/similar; with a URL, --goal gives a focused read (outline with character offsets, then the passages for that need) and --from N the page from character N",
             "doctor": "One billed test call per configured provider",
             "usage": "Remaining credit per provider and key",
             "stats": "Local spend and usage from the search logs (--days N, --prune N)",
@@ -534,6 +644,10 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 args.query = first.clone();
             }
             let more_queries: Vec<String> = args.queries.iter().skip(1).cloned().collect();
+            // --from reads the page whole from that character: no focus.
+            if args.from.is_some() {
+                args.goal = None;
+            }
             let several = !more_queries.is_empty() || args.goal.is_some();
             // --x flag: force X/Twitter search via xAI Grok
             if cli.x_only {
@@ -664,7 +778,7 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 country: args.country.clone(),
                 lang: args.lang.clone(),
                 goal: args.goal.clone(),
-                more_queries,
+                more_queries: more_queries.clone(),
             };
 
             // Query cache (5min TTL). Only plain searches share it — any
@@ -675,18 +789,19 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             // requested mode and how each provider would be reached, so a
             // new key never replays a run that went another way.
             let cache_mode = format!("{}|{}", args.mode, transport_signature(&app));
-            let cacheable = !several
-                && args.providers.is_none()
+            let plain = args.providers.is_none()
                 && opts.include_domains.is_empty()
                 && opts.exclude_domains.is_empty()
                 && opts.freshness.is_none()
                 && opts.country.is_none()
                 && opts.lang.is_none();
+            let cacheable = !several && plain;
             if cacheable && !args.no_cache {
                 if let Some((mut cached, age)) = cache::load_query(&args.query, &cache_mode, count)
                 {
                     mark_replay(&mut cached, Some(age));
                     logging::log_search(&cached);
+                    apply_from(&mut cached, args.from);
                     apply_max_chars(&mut cached, args.max_chars);
                     if ctx.is_json() {
                         output::json::render(&cached);
@@ -700,8 +815,10 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             // auto: decisive rules, then the signal rules, then general. An
             // explicit -m is obeyed as given. A search over several queries
             // or with a goal is a web search: auto would route it on its first
-            // query alone, so it is general.
-            if several && matches!(args.mode, cli::ModeArg::Auto) {
+            // query alone, so it is general. One URL with a goal is a focused
+            // read, which auto routes as it routes the URL.
+            let one_url = more_queries.is_empty() && router::is_absolute_url(args.query.trim());
+            if several && !one_url && matches!(args.mode, cli::ModeArg::Auto) {
                 args.mode = cli::ModeArg::Fixed(types::Mode::General);
             }
             let mut query = args.query.clone();
@@ -748,12 +865,23 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             // query — fail fast (exit 3) instead of feeding a text query to
             // paid scrapers as if it were an address.
             let spec = registry::spec(mode);
-            if several && !engine::WEB_MODES.contains(&mode) {
+            let reads_page = matches!(mode, types::Mode::Extract | types::Mode::Scrape);
+            if !more_queries.is_empty() && !engine::WEB_MODES.contains(&mode)
+                || args.goal.is_some() && !engine::WEB_MODES.contains(&mode) && !reads_page
+            {
                 return bail(
                     errors::SearchError::InvalidInput {
                         message: format!(
-                            "several -q and --goal work in the web search modes (general, news, academic, deep, scholar), not in '{mode}'"
+                            "several -q work in the web search modes (general, news, academic, deep, scholar), and --goal in those and with a URL to read (extract); not in '{mode}'"
                         ),
+                    },
+                    ctx,
+                );
+            }
+            if args.from.is_some() && !reads_page {
+                return bail(
+                    errors::SearchError::InvalidInput {
+                        message: format!("--from reads a page (extract), not in '{mode}'"),
                     },
                     ctx,
                 );
@@ -807,7 +935,8 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             };
 
             let started = std::time::Instant::now();
-            let response = engine::run(app, &query, mode, count, &args.providers, &opts).await;
+            let response =
+                engine::run(app.clone(), &query, mode, count, &args.providers, &opts).await;
 
             if let Some(sp) = spinner {
                 sp.finish_and_clear();
@@ -826,6 +955,23 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
             }
 
             let mut response = response?;
+            if reads_page {
+                mark_page_chars(&mut response);
+                if opts.goal.is_some() {
+                    // The whole page, for the --from reads that follow.
+                    if plain && !response.results.is_empty() {
+                        let mut page = response.clone();
+                        page.metadata.goal = None;
+                        for r in &mut page.results {
+                            if let Some(obj) = r.extra.as_mut().and_then(|e| e.as_object_mut()) {
+                                obj.remove("excerpts");
+                            }
+                        }
+                        cache::save_query(&args.query, &cache_mode, count, &page);
+                    }
+                    focus_page(&app, &mut response, mode, &opts, args.providers.is_some()).await;
+                }
+            }
             // The caller gets results, and a sentence for the owner when an
             // engine needs them; everything else goes to the search log.
             let notes = std::mem::take(&mut response.metadata.warnings);
@@ -850,6 +996,7 @@ async fn run(cli: Cli, ctx: &Ctx, app: Arc<AppContext>) -> Result<i32, errors::S
                 }
             }
             logging::log_search(&response);
+            apply_from(&mut response, args.from);
             apply_max_chars(&mut response, args.max_chars);
 
             if ctx.is_json() {

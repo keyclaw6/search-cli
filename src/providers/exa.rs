@@ -262,6 +262,13 @@ impl Adapter for Exa {
         }
     }
 
+    /// A neural search built for natural-language queries; in a goal search
+    /// it gets the question, as Keenable does (not yet tested here: Exa's
+    /// account was out of credit when that rule was chosen).
+    fn takes_question(&self) -> bool {
+        true
+    }
+
     async fn call(&self, call: &Call<'_>) -> Result<Output, SearchError> {
         if !self.is_configured() {
             return Err(SearchError::AuthMissing { provider: "exa" });
