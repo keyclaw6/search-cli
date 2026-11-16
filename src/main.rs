@@ -326,6 +326,14 @@ fn apply_window(response: &mut types::SearchResponse, from: Option<usize>) {
         if start == 0 && end == n {
             continue;
         }
+        if start >= n {
+            r.snippet =
+                format!("[the page ends at {n} characters; --from {start} is past its end]");
+            if let Some(obj) = r.extra.as_mut().and_then(|e| e.as_object_mut()) {
+                obj.insert("from".to_string(), start.into());
+            }
+            continue;
+        }
         let mut part: String = r
             .snippet
             .chars()

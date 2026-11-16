@@ -1100,4 +1100,18 @@ fn a_long_page_is_read_in_windows() {
         r["snippet"].as_str().unwrap().chars().count() as u64,
         total - 30_000
     );
+    let past = (total + 5).to_string();
+    let v = run(&[
+        "search",
+        "-q",
+        &url,
+        "--from",
+        &past,
+        "--allow-private",
+        "--json",
+    ]);
+    assert_eq!(
+        v["results"][0]["snippet"],
+        format!("[the page ends at {total} characters; --from {past} is past its end]")
+    );
 }
